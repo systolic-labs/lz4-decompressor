@@ -3,38 +3,45 @@
 // ============================================================================
 //  lz4_mmio.v - LZ4 block decompressor as an AXI4-Lite peripheral
 // ----------------------------------------------------------------------------
-//  Wraps lz4_decoder so firmware can drive it byte at a time from the existing
-//  loader, with no new software infrastructure: write a compressed byte, poll,
-//  read a decompressed one.  The CPU stays in the loop between bytes but out of
-//  the inner loop, which is what removes the instruction-fetch cost that made the
-//  software decoder slow - the decoder itself is datapath, not code.
+//  Deliberately the simplest interface that is *correct*.  One byte in, one byte
+//  out, and - the part the first version lacked - a status bit saying whether the
+//  decoder can accept a byte at all.
 //
-//  This is deliberately the simple first step.  A byte per register access is
-//  slower than a DMA engine that feeds the decoder from the flash directly, but
-//  it reuses the QSPI engine and AXI path that already work, and it can be
-//  verified in simulation before anything is built.
+//  Why that bit matters, from the first silicon run: the decoder does not consume
+//  input while it is inside a match, and the kernel's stream contains a 98 576-byte
+//  match.  Software that wrote IN unconditionally overwrote a byte still waiting,
+//  once per byte of that match, desynchronising the stream - the run produced
+//  13 190 715 bytes instead of 11 097 600 with no error flagged, and the kernel
+//  did not boot.  The byte-at-a-time testbench missed it because its vector had
+//  only short matches, so the decoder was almost always ready.  `CTRL` bit 4 now
+//  exposes readiness and firmware waits on it: the constraint lives where software
+//  can respect it.
 //
-//  Register map (word index = addr[5:2], as elsewhere in this SoC):
-//    0x00  CTRL   W: bit0 = clear done/error and start a fresh block
-//                 R: bit0 = busy, bit1 = error, bit2 = done, bit3 = output byte available
-//    0x04  IN     W: [7:0] = byte, [8] = last byte of the block
-//    0x08  OUT    R: [7:0] = decompressed byte; reading releases the decoder
-//    0x0C  PROGRESS R: bits [15:0] = decompressed bytes produced (low 16 bits)
+//  Wider access and background DMA were both tried for speed and neither belongs
+//  in this file: a 64-bit FIFO wrapper did not converge, and the measured MMIO
+//  cost (50-90 cycles per access, against 5 for a 64-bit DDR4 access) means a
+//  byte-per-register interface cannot be fast whatever its width.  Speed needs the
+//  decoder fed by an autonomous engine instead of by the CPU - a separate piece of
+//  work.  This file is the *functional* path, and it is one boot away from proving
+//  the accelerator in silicon.
 //
-//  Window: 64 KiB of BRAM inside the peripheral, so nothing outside has to supply
-//  memory.  Eight BRAM36 tiles on this device, against 418 free.
+//  Register map (word index = addr[5:2]):
+//    0x00  CTRL   W: bit0 = start a fresh block
+//                 R: bit0 busy, bit1 error, bit2 done,
+//                    bit3 = output byte available, bit4 = input accepted
+//    0x04  IN     W: [7:0] compressed byte, [8] = last byte of the block
+//    0x08  OUT    R: [7:0] decompressed byte; reading releases the decoder
+//    0x0C  PROGRESS R: [31:16] bytes in, [15:0] bytes out
 //
-//  Handshake notes that matter, because they are where this kind of wrapper goes
-//  wrong:
-//    * an AXI write is a single-cycle pulse, but the decoder needs in_valid held
-//      until in_ready, so the pending byte is latched and held;
-//    * out_ready must not be raised while a byte is still unread, or the decoder
-//      would overwrite it - so it is raised only when the holding register is
-//      empty, and the decoder backpressures meanwhile;
-//    * the read response must echo s_arid into s_rid and the write response must
-//      echo s_awid into s_bid.  The SoC routes through axi_riscv_atomics, which
-//      matches responses to requests by ID; hardcoding either to zero leaves the
-//      CPU waiting forever, which on silicon looks like "banner then silence".
+//  Window: 64 KiB of block RAM inside the peripheral.  The read is REGISTERED -
+//  that is the decoder's stated contract and it is also what lets Vivado infer
+//  block RAM: a combinational read costs 13 926 LUTs as distributed RAM against
+//  277.
+//
+//  The read response must echo s_arid into s_rid and the write response must echo
+//  s_awid into s_bid: the SoC routes through axi_riscv_atomics, which matches
+//  responses to requests by ID, and hardcoding either leaves the CPU waiting
+//  forever - on silicon, "banner then silence".
 // ============================================================================
 module lz4_mmio #(
     parameter integer AXI_AW = 64,
@@ -44,7 +51,6 @@ module lz4_mmio #(
     input  logic                  clk,
     input  logic                  rst_n,
 
-    // ---- AXI4-Lite slave (full AXI4 signal set; burst/lock/cache ignored) ----
     input  logic [AXI_IDW-1:0]    s_awid,
     input  logic [AXI_AW-1:0]     s_awaddr,
     input  logic [7:0]            s_awlen,
@@ -77,44 +83,38 @@ module lz4_mmio #(
 );
 
     // ------------------------------------------------------------------
-    // History window: 64 KiB inside the peripheral
+    // History window: 64 KiB, registered read
     // ------------------------------------------------------------------
-    // Without ram_style Vivado infers distributed RAM for this array, which
-    // costs ~10 240 LUTs for 64 KiB - a large fraction of the device for what
-    // eight BRAM36 tiles do.  Force the block RAM inference explicitly.
     (* ram_style = "block" *) logic [7:0] win [0:65535];
     logic [15:0] win_waddr, win_raddr;
     logic [7:0]  win_wdata, win_rdata;
     logic        win_we;
+    reg   [7:0]  win_rdata_q;
 
-    // The read is REGISTERED, giving the one cycle of latency the decoder's
-    // contract states.  A combinational read would be more permissive and still
-    // pass simulation, but Vivado cannot infer block RAM for an asynchronous
-    // read: it falls back to distributed RAM, ~10 240 LUTs for 64 KiB, against
-    // eight BRAM36 tiles.  Matching the contract is what makes the memory
-    // infer correctly and the timing honest.
-    reg [7:0] win_rdata_q;
     assign win_rdata = win_rdata_q;
-
     always @(posedge clk) begin
         if (win_we) win[win_waddr] <= win_wdata;
         win_rdata_q <= win[win_raddr];
     end
 
     // ------------------------------------------------------------------
-    // Decoder instance
+    // Byte-at-a-time handshake to software
     // ------------------------------------------------------------------
-    logic        out_avail;       // a decompressed byte is waiting for the CPU
     logic        in_pending;      // a byte is waiting for the decoder
     logic [7:0]  in_byte;
     logic        in_last_q;
-    logic        in_ready;
-    logic        out_ready;
+    logic        in_ready, out_valid;
     logic [7:0]  out_data;
-    logic        out_valid;
+    logic        out_avail;
+    logic [7:0]  out_reg;
     logic        dec_done, dec_error;
+    logic        done_q, error_q, started;
+    logic [31:0] in_count, out_count;
 
-    assign out_ready = ~out_avail;   // never overwrite an unread byte
+    wire busy = started & ~done_q & ~error_q;
+
+    // The decoder takes the pending byte exactly when it says it is ready.
+    wire dec_takes = in_pending && in_ready;
 
     lz4_decoder u_dec (
         .clk        (clk),
@@ -125,7 +125,7 @@ module lz4_mmio #(
         .in_ready   (in_ready),
         .out_data   (out_data),
         .out_valid  (out_valid),
-        .out_ready  (out_ready),
+        .out_ready  (~out_avail),   // never overwrite an unread byte
         .win_waddr  (win_waddr),
         .win_wdata  (win_wdata),
         .win_we     (win_we),
@@ -135,67 +135,44 @@ module lz4_mmio #(
         .error      (dec_error)
     );
 
-    // ------------------------------------------------------------------
-    // Peripheral state
-    // ------------------------------------------------------------------
-    logic [7:0]  out_reg;
-    logic        done_q, error_q;
-    logic        started;
-    logic [31:0] out_count;
-
-    // busy is only meaningful once a block has been started; before that the
-    // decoder is idle and reporting "busy" would invite a software deadlock.
-    wire busy = started & ~done_q & ~error_q;
-
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            in_pending <= 1'b0;
-            in_byte    <= 8'd0;
-            in_last_q  <= 1'b0;
-            out_avail  <= 1'b0;
-            out_reg    <= 8'd0;
-            done_q     <= 1'b0;
-            error_q    <= 1'b0;
-            started    <= 1'b0;
-            out_count  <= 32'd0;
+            in_pending <= 1'b0; in_byte <= 8'd0; in_last_q <= 1'b0;
+            out_avail <= 1'b0;  out_reg <= 8'd0;
+            done_q <= 1'b0; error_q <= 1'b0; started <= 1'b0;
+            in_count <= 32'd0; out_count <= 32'd0;
         end else begin
-            // -- input: hold the byte until the decoder takes it --------------
-            if (in_pending && in_ready) in_pending <= 1'b0;
+            if (dec_takes) in_pending <= 1'b0;
 
-            // -- output: latch a produced byte if the register is free --------
             if (out_valid && !out_avail) begin
                 out_reg   <= out_data;
                 out_avail <= 1'b1;
                 out_count <= out_count + 32'd1;
             end
-
-            // -- decoder status is sticky until the next start ----------------
             if (dec_done)  done_q  <= 1'b1;
             if (dec_error) error_q <= 1'b1;
 
-            // -- register writes ---------------------------------------------
             if (wr_hit) begin
                 case (wr_reg)
-                4'd0: begin                       // CTRL: start a fresh block
-                    if (s_wdata[0]) begin
-                        started    <= 1'b1;
-                        done_q     <= 1'b0;
-                        error_q    <= 1'b0;
-                        out_count  <= 32'd0;
-                        out_avail  <= 1'b0;
-                        in_pending <= 1'b0;
-                    end
+                4'd0: if (s_wdata[0]) begin
+                    started    <= 1'b1;
+                    done_q     <= 1'b0;
+                    error_q    <= 1'b0;
+                    out_avail  <= 1'b0;
+                    in_pending <= 1'b0;
+                    in_count   <= 32'd0;
+                    out_count  <= 32'd0;
                 end
-                4'd1: begin                       // IN: byte, and the last flag
+                4'd1: begin
                     in_byte    <= s_wdata[7:0];
                     in_last_q  <= s_wdata[8];
                     in_pending <= 1'b1;
+                    in_count   <= in_count + 32'd1;
                 end
                 default: ;
                 endcase
             end
 
-            // -- reading OUT releases the decoder ----------------------------
             if (rd_hit && rd_reg == 4'd2) out_avail <= 1'b0;
         end
     end
@@ -210,18 +187,13 @@ module lz4_mmio #(
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            s_awready <= 1'b1;
-            s_wready  <= 1'b0;
-            s_bvalid  <= 1'b0;
-            s_bid     <= '0;
-            s_bresp   <= 2'b00;
-            aw_cap    <= 1'b0;
-            aw_id_q   <= '0;
-            wr_reg    <= 4'd0;
+            s_awready <= 1'b1; s_wready <= 1'b0; s_bvalid <= 1'b0;
+            s_bid <= '0; s_bresp <= 2'b00; aw_cap <= 1'b0;
+            aw_id_q <= '0; wr_reg <= 4'd0;
         end else begin
             if (s_awready && s_awvalid) begin
                 wr_reg    <= s_awaddr[5:2];
-                aw_id_q   <= s_awid;          // must be echoed in B
+                aw_id_q   <= s_awid;
                 aw_cap    <= 1'b1;
                 s_awready <= 1'b0;
                 s_wready  <= 1'b1;
@@ -247,24 +219,24 @@ module lz4_mmio #(
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            s_arready <= 1'b1;
-            s_rvalid  <= 1'b0;
-            s_rid     <= '0;
-            s_rdata   <= '0;
-            s_rresp   <= 2'b00;
-            s_rlast   <= 1'b0;
-            rd_reg    <= 4'd0;
+            s_arready <= 1'b1; s_rvalid <= 1'b0; s_rid <= '0;
+            s_rdata <= '0; s_rresp <= 2'b00; s_rlast <= 1'b0; rd_reg <= 4'd0;
         end else begin
             if (s_arready && s_arvalid) begin
                 s_arready <= 1'b0;
                 s_rvalid  <= 1'b1;
-                s_rid     <= s_arid;          // must be echoed in R
+                s_rid     <= s_arid;
                 s_rlast   <= 1'b1;
                 rd_reg    <= s_araddr[5:2];
                 case (s_araddr[5:2])
-                4'd0: s_rdata <= {60'd0, out_avail, done_q, error_q, busy};
+                // bit4 = "writing a byte now will be taken", which is NOT the
+                // same as "no byte is pending": inside a match the decoder owes
+                // no byte yet wants none, and a write then would be overwritten
+                // at the next clock.  Readiness is the decoder actually asking.
+                4'd0: s_rdata <= {59'd0, (~in_pending && in_ready), out_avail,
+                                  done_q, error_q, busy};
                 4'd2: s_rdata <= {56'd0, out_reg};
-                4'd3: s_rdata <= {32'd0, out_count};
+                4'd3: s_rdata <= {in_count[15:0], out_count[15:0]};
                 default: s_rdata <= '0;
                 endcase
             end

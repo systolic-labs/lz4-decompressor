@@ -3,15 +3,15 @@
 // ============================================================================
 //  tb_lz4_mmio.v - AXI-level self-checking testbench for lz4_mmio
 // ----------------------------------------------------------------------------
-//  Drives the peripheral the way firmware will: start a block, write compressed
-//  bytes, poll for output, read it.  Every decompressed byte is compared against
-//  the original, so this checks the integration contract - register map, handshake,
-//  ID echo - and not only the decoder.
+//  Drives the peripheral the way firmware will: start a block, wait until CTRL
+//  says the decoder can accept a byte, write it, collect output, repeat.
 //
-//  Channel handling, which is where this went wrong the first time: every signal
-//  is held until the slave has taken it, and the slave's registered readies are
-//  sampled on the FALLING edge.  Sampling after a rising edge reads a ready that
-//  has already been lowered, the transaction is dropped, and the DUT looks dead.
+//  The wait on bit 4 is the whole point.  The decoder does not consume input
+//  while it is inside a match, and the kernel vector below contains a 98 576-byte
+//  match; software that writes without waiting overwrites a waiting byte once per
+//  byte of that match.  The first version had no such bit and produced a
+//  corrupted 13 190 715-byte "kernel" with no error flagged.  A testbench that
+//  ignores bit 4 would certify exactly that bug, so it is checked, not assumed.
 //
 //  iverilog -g2012 -o tb_mmio tb_lz4_mmio.v lz4_mmio.v lz4_decoder.v && vvp tb_mmio
 // ============================================================================
@@ -55,13 +55,14 @@ module tb_lz4_mmio;
     reg [7:0] got_bytes    [0:`EXP_LEN-1];
 
     integer i, nout, errs, first_bad, k, wdog;
-    reg     more, drain;
     reg [1023:0] verdict;
     reg [63:0] rd_value;
 
-    // ---- write one register: hold both channels until each is taken --------
     task axi_write(input [63:0] addr, input [63:0] data);
         begin
+            // Hold every channel signal until the slave takes it, and sample the
+            // registered readies on the FALLING edge: after a rising edge they
+            // have already been lowered and the transaction is silently dropped.
             s_awid = 8'hA5; s_awaddr = addr; s_awvalid = 1'b1;
             s_wdata = data; s_wstrb = 8'hFF; s_wlast = 1'b1; s_wvalid = 1'b1;
             @(negedge clk);
@@ -105,35 +106,37 @@ module tb_lz4_mmio;
         rst_n = 1'b1;
         repeat (4) @(posedge clk);
 
-        axi_write(A_CTRL, 64'h1);                 // start a block
+        axi_write(A_CTRL, 64'h1);                    // start a block
 
         for (i = 0; i < `IN_LEN; i = i + 1) begin
+            // Wait until the decoder can take a byte.  This is the fix: without
+            // it, every write inside a long match destroys a waiting byte.
+            wdog = 0;
+            axi_read(A_CTRL);
+            while (!rd_value[4] && wdog < 8192) begin
+                axi_read(A_CTRL);
+                wdog = wdog + 1;
+            end
+
             axi_write(A_IN, {55'd0, (i == `IN_LEN - 1), input_bytes[i]});
 
-            // Drain what is ready before feeding more, exactly as firmware will.
-            wdog = 0; drain = 1'b1;
-            while (drain && wdog < 512) begin
+            // Drain whatever is ready before moving on.
+            axi_read(A_CTRL);
+            while (rd_value[3] && nout < `EXP_LEN) begin
+                axi_read(A_OUT);
+                got_bytes[nout] = rd_value[7:0];
+                nout = nout + 1;
                 axi_read(A_CTRL);
-                if (rd_value[3]) begin              // bit3 = output byte available
-                    axi_read(A_OUT);
-                    if (nout < `EXP_LEN) got_bytes[nout] = rd_value[7:0];
-                    nout = nout + 1;
-                end else begin
-                    drain = 1'b0;
-                end
-                wdog = wdog + 1;
             end
         end
 
         // Drain the remainder and wait for done.
-        wdog = 0; more = 1'b1;
-        while (more && wdog < 400000) begin
+        wdog = 0;
+        while (!rd_value[2] && wdog < 400000) begin
             axi_read(A_CTRL);
-            if (rd_value[2]) begin                  // bit2 = done
-                more = 1'b0;
-            end else if (rd_value[3]) begin
+            if (rd_value[3] && nout < `EXP_LEN) begin
                 axi_read(A_OUT);
-                if (nout < `EXP_LEN) got_bytes[nout] = rd_value[7:0];
+                got_bytes[nout] = rd_value[7:0];
                 nout = nout + 1;
             end
             wdog = wdog + 1;
@@ -142,12 +145,11 @@ module tb_lz4_mmio;
         axi_read(A_CTRL);
         if (rd_value[1]) errs = errs + 1;            // bit1 = error
 
-        for (k = 0; k < `EXP_LEN; k = k + 1) begin
+        for (k = 0; k < `EXP_LEN; k = k + 1)
             if (got_bytes[k] !== expect_bytes[k]) begin
                 if (first_bad < 0) first_bad = k;
                 errs = errs + 1;
             end
-        end
         if (nout != `EXP_LEN) errs = errs + 1;
 
         verdict = "PASS";
@@ -166,11 +168,8 @@ module tb_lz4_mmio;
     end
 
     initial begin
-        // Generous: a real kernel vector is ~389 000 AXI transactions, each of
-        // which costs ~20 clocks of handshaking, so 50 ms of simulated time is
-        // not enough and would look like a hang rather than a slow test.
-        #600_000_000;
-        $display("TIMEOUT: no completion after 600 ms of simulated time");
+        #400_000_000;
+        $display("TIMEOUT: no completion after 400 ms of simulated time");
         $finish;
     end
 
