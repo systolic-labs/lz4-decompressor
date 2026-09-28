@@ -49,12 +49,13 @@ module tb_lz4_mmio;
     );
 
     localparam [63:0] A_CTRL = 64'h00, A_IN = 64'h04, A_OUT = 64'h08;
+    localparam [63:0] A_PRODUCED = 64'h0C, A_TAKEN = 64'h10, A_FLAGS = 64'h14;
 
     reg [7:0] input_bytes  [0:`IN_LEN-1];
     reg [7:0] expect_bytes [0:`EXP_LEN-1];
     reg [7:0] got_bytes    [0:`EXP_LEN-1];
 
-    integer i, nout, errs, first_bad, k, wdog;
+    integer i, nout, errs, first_bad, k, wdog, extra;
     reg [1023:0] verdict;
     reg [63:0] rd_value;
 
@@ -101,7 +102,7 @@ module tb_lz4_mmio;
     initial begin
         $readmemh("in.hex", input_bytes);
         $readmemh("exp.hex", expect_bytes);
-        nout = 0; errs = 0; first_bad = -1;
+        nout = 0; errs = 0; first_bad = -1; extra = 0;
         repeat (6) @(posedge clk);
         rst_n = 1'b1;
         repeat (4) @(posedge clk);
@@ -120,11 +121,18 @@ module tb_lz4_mmio;
 
             axi_write(A_IN, {55'd0, (i == `IN_LEN - 1), input_bytes[i]});
 
-            // Drain whatever is ready before moving on.
+            // Drain whatever is ready before moving on.  The delay before each
+            // output read is the whole point: on silicon a register access costs
+            // 50-90 cycles while this bench used a handful, so the decoder was
+            // never actually made to wait on a full output holding register.  That
+            // stall path is where silicon emits every byte twice, and a bench that
+            // drains at full speed cannot see it.
             axi_read(A_CTRL);
-            while (rd_value[3] && nout < `EXP_LEN) begin
+            while (rd_value[3] && nout < `EXP_LEN + 200000) begin
+                for (k = 0; k < 60; k = k + 1) @(posedge clk);   // model the CPU
                 axi_read(A_OUT);
-                got_bytes[nout] = rd_value[7:0];
+                if (nout < `EXP_LEN) got_bytes[nout] = rd_value[7:0];
+                else extra = extra + 1;    // past the expected end: a duplicate
                 nout = nout + 1;
                 axi_read(A_CTRL);
             end
@@ -134,9 +142,10 @@ module tb_lz4_mmio;
         wdog = 0;
         while (!rd_value[2] && wdog < 400000) begin
             axi_read(A_CTRL);
-            if (rd_value[3] && nout < `EXP_LEN) begin
+            if (rd_value[3] && nout < `EXP_LEN + 200000) begin
                 axi_read(A_OUT);
-                got_bytes[nout] = rd_value[7:0];
+                if (nout < `EXP_LEN) got_bytes[nout] = rd_value[7:0];
+                else extra = extra + 1;
                 nout = nout + 1;
             end
             wdog = wdog + 1;
@@ -159,6 +168,7 @@ module tb_lz4_mmio;
         $display("--------------------------------------------------");
         $display("  compressed     : %0d", `IN_LEN);
         $display("  decompressed   : %0d of %0d expected", nout, `EXP_LEN);
+        $display("  extra past end : %0d   (silicon produced 2 093 115)", extra);
         if (first_bad >= 0)
             $display("  first mismatch : byte %0d  got %02x  expected %02x",
                      first_bad, got_bytes[first_bad], expect_bytes[first_bad]);
@@ -168,8 +178,11 @@ module tb_lz4_mmio;
     end
 
     initial begin
-        #400_000_000;
-        $display("TIMEOUT: no completion after 400 ms of simulated time");
+        // 20 s of simulated time: the real kernel stream needs ~220 ms of AXI
+        // traffic and the drain models the CPU's 60-cycle access cost, so the old
+        // 400 ms watchdog killed the run at a few percent of the way through.
+        #20_000_000_000;
+        $display("TIMEOUT: no completion after 20 s of simulated time");
         $finish;
     end
 

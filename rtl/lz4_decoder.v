@@ -115,7 +115,15 @@ module lz4_decoder (
     // Handshake: consumed on in_valid && in_ready, and every state that reads
     // an input byte asserts ready combinationally.
     // ---------------------------------------------------------------------
-    assign in_ready = (st == S_TOKEN)   ? 1'b1 :
+    // Backpressure.  in_ready used to ignore the output holding register
+    // entirely, so the decoder would consume an input byte, emit its one-cycle
+    // out_valid pulse, and have the wrapper drop it because out_avail was still
+    // set - the byte was written to the window but never reached software, and
+    // the sequence lost a byte.  On silicon the CPU's drain is far slower than
+    // the decoder, so that came up constantly.  Refusing input while a byte is
+    // waiting costs nothing: the decoder drains its output on its own.
+    assign in_ready = (!out_ready) ? 1'b0 :
+                      (st == S_TOKEN)   ? 1'b1 :
                       (st == S_LITEXT)  ? 1'b1 :
                       (st == S_OFF_LO)  ? 1'b1 :
                       (st == S_OFF_HI)  ? 1'b1 :

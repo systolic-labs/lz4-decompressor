@@ -187,7 +187,15 @@ module lz4_mmio #(
                 endcase
             end
 
-            if (rd_hit && rd_reg == 4'd2) out_avail <= 1'b0;
+            // Clear on the OUT read ITSELF, using the current address.  rd_reg is
+            // loaded at the end of the AR handshake, so testing it here looked one
+            // access into the past: out_avail was only released on the access AFTER
+            // the OUT read, and the CTRL read in between still reported bit3=1 for a
+            // byte already consumed.  Software following the documented pattern
+            // (read CTRL, if bit3 read OUT) then read OUT a second time and got the
+            // same out_reg back -- one duplicated byte per starvation episode, which
+            // is exactly the 13 190 715 produced against 11 097 600 expected.
+            if (rd_hit && s_araddr[5:2] == 4'd2) out_avail <= 1'b0;
         end
     end
 
