@@ -110,6 +110,13 @@ module lz4_mmio #(
     logic        dec_done, dec_error;
     logic        done_q, error_q, started;
     logic [31:0] in_count, out_count;
+    // Instrumentation, because two different wrappers produced the same wrong
+    // output length on silicon (13 190 715 against 11 097 600) while simulation
+    // passed.  take_count is what the DECODER actually consumed and last_taken
+    // whether the end-of-block flag ever reached it: together they separate "the
+    // wrapper loses input" from "the decoder misses the end of the block".
+    logic [31:0] take_count;
+    logic        last_taken;
 
     wire busy = started & ~done_q & ~error_q;
 
@@ -141,8 +148,13 @@ module lz4_mmio #(
             out_avail <= 1'b0;  out_reg <= 8'd0;
             done_q <= 1'b0; error_q <= 1'b0; started <= 1'b0;
             in_count <= 32'd0; out_count <= 32'd0;
+            take_count <= 32'd0; last_taken <= 1'b0;
         end else begin
-            if (dec_takes) in_pending <= 1'b0;
+            if (dec_takes) begin
+                in_pending <= 1'b0;
+                take_count <= take_count + 32'd1;
+                last_taken <= in_last_q;      // sticky: did the end flag ever land
+            end
 
             if (out_valid && !out_avail) begin
                 out_reg   <= out_data;
@@ -162,6 +174,8 @@ module lz4_mmio #(
                     in_pending <= 1'b0;
                     in_count   <= 32'd0;
                     out_count  <= 32'd0;
+                    take_count <= 32'd0;
+                    last_taken <= 1'b0;
                 end
                 4'd1: begin
                     in_byte    <= s_wdata[7:0];
@@ -236,7 +250,13 @@ module lz4_mmio #(
                 4'd0: s_rdata <= {59'd0, (~in_pending && in_ready), out_avail,
                                   done_q, error_q, busy};
                 4'd2: s_rdata <= {56'd0, out_reg};
-                4'd3: s_rdata <= {in_count[15:0], out_count[15:0]};
+                4'd3: s_rdata <= {32'd0, out_count};      // bytes produced
+                // 0x10: what the decoder consumed, and whether it ever saw the
+                // end-of-block flag.  A short take_count means the wrapper lost
+                // input; a full one with the flag clear means the end was never
+                // signalled to the decoder.
+                4'd4: s_rdata <= {32'd0, take_count};
+                4'd5: s_rdata <= {30'd0, last_taken, started};
                 default: s_rdata <= '0;
                 endcase
             end
