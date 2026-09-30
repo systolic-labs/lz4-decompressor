@@ -274,6 +274,11 @@ module lz4_mmio #(
                                   done_q, error_q, busy};
                 4'd6: s_rdata <= o_stage;              // 8 staged bytes, read is idempotent
                 4'd7: s_rdata <= {60'd0, o_cnt};       // how many of them are valid
+                // The staged word is read as two 32-bit halves, not one 64-bit
+                // load: a 64-bit MMIO load never completes on this interconnect
+                // (no RVALID, core waits forever) and the loader hung on it right
+                // after printing "Kernel".  Both halves are idempotent reads.
+                4'd8: s_rdata <= {32'd0, o_stage[63:32]};
                 4'd3: s_rdata <= {32'd0, out_count};      // bytes produced
                 // 0x10: what the decoder consumed, and whether it ever saw the
                 // end-of-block flag.  A short take_count means the wrapper lost

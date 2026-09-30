@@ -52,13 +52,14 @@ module tb_lz4_mmio;
     localparam [63:0] A_PRODUCED = 64'h0C, A_TAKEN = 64'h10, A_FLAGS = 64'h14;
     // 8 staged bytes, read idempotently; the valid count; and consumption is an
     // explicit write to CTRL bit1 - never a side effect of the read.
-    localparam [63:0] A_O64 = 64'h18, A_OSTAT = 64'h1C;
+    localparam [63:0] A_O64 = 64'h18, A_OSTAT = 64'h1C, A_O64HI = 64'h20;
 
     reg [7:0] input_bytes  [0:`IN_LEN-1];
     reg [7:0] expect_bytes [0:`EXP_LEN-1];
     reg [7:0] got_bytes    [0:`EXP_LEN-1];
 
     integer i, nout, errs, first_bad, k, wdog, extra, j, nv, draining, ready;
+    reg [63:0] w64;
     // Dedicated loop counters.  wdog is reset to 0 inside every axi_read, so a
     // wait loop that calls axi_read and tests wdog can never trip its own
     // bound: it would spin forever if the condition it waits on never comes.
@@ -116,10 +117,13 @@ module tb_lz4_mmio;
             axi_read(A_OSTAT);
             if (rd_value[3:0] != 0) begin
                 nv = rd_value[3:0];
-                axi_read(A_O64);
+                // two 32-bit reads, matching what the loader must do: a 64-bit
+                // MMIO load never completes on this interconnect
+                axi_read(A_O64);   w64[31:0]  = rd_value[31:0];
+                axi_read(A_O64HI); w64[63:32] = rd_value[31:0];
                 for (j = 0; j < 8; j = j + 1)
                     if (j < nv) begin
-                        if (nout < `EXP_LEN) got_bytes[nout] = rd_value[8*j +: 8];
+                        if (nout < `EXP_LEN) got_bytes[nout] = w64[8*j +: 8];
                         else extra = extra + 1;
                         nout = nout + 1;
                     end
@@ -181,10 +185,13 @@ module tb_lz4_mmio;
             axi_read(A_OSTAT);
             if (rd_value[3:0] != 0) begin
                 nv = rd_value[3:0];
-                axi_read(A_O64);
+                // two 32-bit reads, matching what the loader must do: a 64-bit
+                // MMIO load never completes on this interconnect
+                axi_read(A_O64);   w64[31:0]  = rd_value[31:0];
+                axi_read(A_O64HI); w64[63:32] = rd_value[31:0];
                 for (j = 0; j < 8; j = j + 1)
                     if (j < nv) begin
-                        if (nout < `EXP_LEN) got_bytes[nout] = rd_value[8*j +: 8];
+                        if (nout < `EXP_LEN) got_bytes[nout] = w64[8*j +: 8];
                         else extra = extra + 1;
                         nout = nout + 1;
                     end
