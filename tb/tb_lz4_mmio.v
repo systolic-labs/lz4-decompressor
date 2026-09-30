@@ -50,12 +50,19 @@ module tb_lz4_mmio;
 
     localparam [63:0] A_CTRL = 64'h00, A_IN = 64'h04, A_OUT = 64'h08;
     localparam [63:0] A_PRODUCED = 64'h0C, A_TAKEN = 64'h10, A_FLAGS = 64'h14;
+    // 8 staged bytes, read idempotently; the valid count; and consumption is an
+    // explicit write to CTRL bit1 - never a side effect of the read.
+    localparam [63:0] A_O64 = 64'h18, A_OSTAT = 64'h1C;
 
     reg [7:0] input_bytes  [0:`IN_LEN-1];
     reg [7:0] expect_bytes [0:`EXP_LEN-1];
     reg [7:0] got_bytes    [0:`EXP_LEN-1];
 
-    integer i, nout, errs, first_bad, k, wdog, extra;
+    integer i, nout, errs, first_bad, k, wdog, extra, j, nv, draining, ready;
+    // Dedicated loop counters.  wdog is reset to 0 inside every axi_read, so a
+    // wait loop that calls axi_read and tests wdog can never trip its own
+    // bound: it would spin forever if the condition it waits on never comes.
+    integer wcnt, dcnt;
     reg [1023:0] verdict;
     reg [63:0] rd_value;
 
@@ -99,6 +106,28 @@ module tb_lz4_mmio;
         end
     endtask
 
+    // Take one staged group: read the valid count, read the word, consume it with
+    // an explicit write.  Factored out because it has to run *inside* the
+    // readiness wait too: once 8 bytes are staged the decoder's out_ready drops,
+    // so a wait that does not drain leaves the decoder stalled and the bench
+    // spins its whole bound on every single input byte.
+    task drain_once;
+        begin
+            axi_read(A_OSTAT);
+            if (rd_value[3:0] != 0) begin
+                nv = rd_value[3:0];
+                axi_read(A_O64);
+                for (j = 0; j < 8; j = j + 1)
+                    if (j < nv) begin
+                        if (nout < `EXP_LEN) got_bytes[nout] = rd_value[8*j +: 8];
+                        else extra = extra + 1;
+                        nout = nout + 1;
+                    end
+                axi_write(A_CTRL, 64'h2);
+            end
+        end
+    endtask
+
     initial begin
         $readmemh("in.hex", input_bytes);
         $readmemh("exp.hex", expect_bytes);
@@ -112,11 +141,18 @@ module tb_lz4_mmio;
         for (i = 0; i < `IN_LEN; i = i + 1) begin
             // Wait until the decoder can take a byte.  This is the fix: without
             // it, every write inside a long match destroys a waiting byte.
-            wdog = 0;
-            axi_read(A_CTRL);
-            while (!rd_value[4] && wdog < 8192) begin
+            // The bound has to cover the decoder's longest match: it takes no
+            // input while copying, and giving up means writing anyway, which
+            // overwrites the pending byte and loses the following sequence.  A
+            // 40 000-byte match is ~80 000 cycles, about 3 000 iterations here.
+            // Generous is safe now that wcnt is a dedicated counter - the loop
+            // really does expire, and it drains while it waits.
+            wcnt = 0; ready = 0;
+            while (!ready && wcnt < 400000) begin
+                drain_once;                 // keep the staging moving while we wait
                 axi_read(A_CTRL);
-                wdog = wdog + 1;
+                if (rd_value[4]) ready = 1;
+                wcnt = wcnt + 1;
             end
 
             axi_write(A_IN, {55'd0, (i == `IN_LEN - 1), input_bytes[i]});
@@ -127,28 +163,43 @@ module tb_lz4_mmio;
             // never actually made to wait on a full output holding register.  That
             // stall path is where silicon emits every byte twice, and a bench that
             // drains at full speed cannot see it.
-            axi_read(A_CTRL);
-            while (rd_value[3] && nout < `EXP_LEN + 200000) begin
-                for (k = 0; k < 60; k = k + 1) @(posedge clk);   // model the CPU
-                axi_read(A_OUT);
-                if (nout < `EXP_LEN) got_bytes[nout] = rd_value[7:0];
-                else extra = extra + 1;    // past the expected end: a duplicate
-                nout = nout + 1;
-                axi_read(A_CTRL);
+            dcnt = 0; draining = 1;
+            while (draining && dcnt < 64) begin
+                axi_read(A_OSTAT);
+                if (rd_value[3:0] == 0) draining = 0;
+                else begin drain_once; dcnt = dcnt + 1; end
             end
         end
 
         // Drain the remainder and wait for done.
         wdog = 0;
-        while (!rd_value[2] && wdog < 400000) begin
+        // Same reasoning: each pass costs several AXI accesses, and the tail
+        // after the last input byte is at most one staged group.
+        dcnt = 0;
+        while (!rd_value[2] && dcnt < 20000) begin
             axi_read(A_CTRL);
-            if (rd_value[3] && nout < `EXP_LEN + 200000) begin
-                axi_read(A_OUT);
-                if (nout < `EXP_LEN) got_bytes[nout] = rd_value[7:0];
-                else extra = extra + 1;
-                nout = nout + 1;
+            axi_read(A_OSTAT);
+            if (rd_value[3:0] != 0) begin
+                nv = rd_value[3:0];
+                axi_read(A_O64);
+                for (j = 0; j < 8; j = j + 1)
+                    if (j < nv) begin
+                        if (nout < `EXP_LEN) got_bytes[nout] = rd_value[8*j +: 8];
+                        else extra = extra + 1;
+                        nout = nout + 1;
+                    end
+                axi_write(A_CTRL, 64'h2);
             end
-            wdog = wdog + 1;
+            dcnt = dcnt + 1;
+        end
+
+        // `done` may assert with a final group still staged, so take it
+        // unconditionally: the last bytes of the stream are exactly that group.
+        draining = 1;
+        while (draining) begin
+            axi_read(A_OSTAT);
+            if (rd_value[3:0] == 0) draining = 0;
+            else drain_once;
         end
 
         axi_read(A_CTRL);

@@ -105,8 +105,14 @@ module lz4_mmio #(
     logic        in_last_q;
     logic        in_ready, out_valid;
     logic [7:0]  out_data;
-    logic        out_avail;
-    logic [7:0]  out_reg;
+    // Output is staged 8 bytes at a time.  The old scheme made reading OUT
+    // destructive: the byte was released by the read itself, cleared by an
+    // access-derived condition, and every bug in this peripheral came out of
+    // that (a clear one access late duplicated every literal).  Reading the
+    // staged word is now idempotent and software advances with an explicit
+    // write, so a re-read cannot duplicate anything.
+    logic [63:0] o_stage;
+    logic [3:0]  o_cnt;      // valid bytes in o_stage, 0..8
     logic        dec_done, dec_error;
     logic        done_q, error_q, started;
     logic [31:0] in_count, out_count;
@@ -132,7 +138,7 @@ module lz4_mmio #(
         .in_ready   (in_ready),
         .out_data   (out_data),
         .out_valid  (out_valid),
-        .out_ready  (~out_avail),   // never overwrite an unread byte
+        .out_ready  (o_cnt < 4'd8), // room in the staging register
         .win_waddr  (win_waddr),
         .win_wdata  (win_wdata),
         .win_we     (win_we),
@@ -145,7 +151,7 @@ module lz4_mmio #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             in_pending <= 1'b0; in_byte <= 8'd0; in_last_q <= 1'b0;
-            out_avail <= 1'b0;  out_reg <= 8'd0;
+            o_stage <= 64'd0; o_cnt <= 4'd0;
             done_q <= 1'b0; error_q <= 1'b0; started <= 1'b0;
             in_count <= 32'd0; out_count <= 32'd0;
             take_count <= 32'd0; last_taken <= 1'b0;
@@ -156,10 +162,18 @@ module lz4_mmio #(
                 last_taken <= in_last_q;      // sticky: did the end flag ever land
             end
 
-            if (out_valid && !out_avail) begin
-                out_reg   <= out_data;
-                out_avail <= 1'b1;
+            if (out_valid && (o_cnt < 4'd8)) begin
+                o_stage   <= o_stage | (({56'd0, out_data}) << ({o_cnt, 3'b000}));
+                o_cnt     <= o_cnt + 4'd1;
                 out_count <= out_count + 32'd1;
+            end
+            // Explicit consume: software has taken the staged word.  Only a
+            // write does this - never a read.
+            // Clearing the count is not enough: the staged bits have to go too,
+            // or the next group ORs into the leftovers of the previous one.
+            if (wr_hit && wr_reg == 4'd0 && s_wdata[1]) begin
+                o_cnt   <= 4'd0;
+                o_stage <= 64'd0;
             end
             if (dec_done)  done_q  <= 1'b1;
             if (dec_error) error_q <= 1'b1;
@@ -170,7 +184,7 @@ module lz4_mmio #(
                     started    <= 1'b1;
                     done_q     <= 1'b0;
                     error_q    <= 1'b0;
-                    out_avail  <= 1'b0;
+                    o_cnt      <= 4'd0;
                     in_pending <= 1'b0;
                     in_count   <= 32'd0;
                     out_count  <= 32'd0;
@@ -195,7 +209,8 @@ module lz4_mmio #(
             // (read CTRL, if bit3 read OUT) then read OUT a second time and got the
             // same out_reg back -- one duplicated byte per starvation episode, which
             // is exactly the 13 190 715 produced against 11 097 600 expected.
-            if (rd_hit && s_araddr[5:2] == 4'd2) out_avail <= 1'b0;
+            // (no read side effect any more: the staged data is only consumed
+            // by the explicit write above.)
         end
     end
 
@@ -255,9 +270,10 @@ module lz4_mmio #(
                 // same as "no byte is pending": inside a match the decoder owes
                 // no byte yet wants none, and a write then would be overwritten
                 // at the next clock.  Readiness is the decoder actually asking.
-                4'd0: s_rdata <= {59'd0, (~in_pending && in_ready), out_avail,
+                4'd0: s_rdata <= {59'd0, (~in_pending && in_ready), (o_cnt != 4'd0),
                                   done_q, error_q, busy};
-                4'd2: s_rdata <= {56'd0, out_reg};
+                4'd6: s_rdata <= o_stage;              // 8 staged bytes, read is idempotent
+                4'd7: s_rdata <= {60'd0, o_cnt};       // how many of them are valid
                 4'd3: s_rdata <= {32'd0, out_count};      // bytes produced
                 // 0x10: what the decoder consumed, and whether it ever saw the
                 // end-of-block flag.  A short take_count means the wrapper lost
