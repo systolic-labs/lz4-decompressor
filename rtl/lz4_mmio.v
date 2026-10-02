@@ -276,9 +276,13 @@ module lz4_mmio #(
                 4'd7: s_rdata <= {60'd0, o_cnt};       // how many of them are valid
                 // The staged word is read as two 32-bit halves, not one 64-bit
                 // load: a 64-bit MMIO load never completes on this interconnect
-                // (no RVALID, core waits forever) and the loader hung on it right
-                // after printing "Kernel".  Both halves are idempotent reads.
-                4'd8: s_rdata <= {32'd0, o_stage[63:32]};
+                // (no RVALID, core waits forever).  The high half lives at 0x08,
+                // the old byte register, which is free now that reading no longer
+                // consumes - deliberately NOT at 0x20: everything this peripheral
+                // has ever decoded sits between 0x00 and 0x1C, and an address the
+                // interconnect does not route answers nothing, which hangs the
+                // core exactly the same way.  Stay inside the proven window.
+                4'd2: s_rdata <= {32'd0, o_stage[63:32]};
                 4'd3: s_rdata <= {32'd0, out_count};      // bytes produced
                 // 0x10: what the decoder consumed, and whether it ever saw the
                 // end-of-block flag.  A short take_count means the wrapper lost

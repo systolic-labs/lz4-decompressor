@@ -52,7 +52,7 @@ module tb_lz4_mmio;
     localparam [63:0] A_PRODUCED = 64'h0C, A_TAKEN = 64'h10, A_FLAGS = 64'h14;
     // 8 staged bytes, read idempotently; the valid count; and consumption is an
     // explicit write to CTRL bit1 - never a side effect of the read.
-    localparam [63:0] A_O64 = 64'h18, A_OSTAT = 64'h1C, A_O64HI = 64'h20;
+    localparam [63:0] A_O64 = 64'h18, A_OSTAT = 64'h1C, A_O64HI = 64'h08;
 
     reg [7:0] input_bytes  [0:`IN_LEN-1];
     reg [7:0] expect_bytes [0:`EXP_LEN-1];
