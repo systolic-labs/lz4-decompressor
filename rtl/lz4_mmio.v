@@ -169,11 +169,15 @@ module lz4_mmio #(
             end
             // Explicit consume: software has taken the staged word.  Only a
             // write does this - never a read.
-            // Clearing the count is not enough: the staged bits have to go too,
-            // or the next group ORs into the leftovers of the previous one.
+            // Consume exactly what software read, not everything.  Software reads
+            // the count, then the data, then consumes - and the decoder can stage
+            // more bytes in between.  Clearing everything dropped those, which is
+            // the 5% shortfall the loader reported (10 540 334 bytes against
+            // 11 097 600).  The write carries the count; the remainder shifts down
+            // so the bytes that arrived keep their order.
             if (wr_hit && wr_reg == 4'd0 && s_wdata[1]) begin
-                o_cnt   <= 4'd0;
-                o_stage <= 64'd0;
+                o_cnt   <= o_cnt - s_wdata[7:4];
+                o_stage <= o_stage >> ({s_wdata[7:4], 3'b000});
             end
             if (dec_done)  done_q  <= 1'b1;
             if (dec_error) error_q <= 1'b1;
@@ -270,10 +274,18 @@ module lz4_mmio #(
                 // same as "no byte is pending": inside a match the decoder owes
                 // no byte yet wants none, and a write then would be overwritten
                 // at the next clock.  Readiness is the decoder actually asking.
-                4'd0: s_rdata <= {59'd0, (~in_pending && in_ready), (o_cnt != 4'd0),
-                                  done_q, error_q, busy};
-                4'd6: s_rdata <= o_stage;              // 8 staged bytes, read is idempotent
-                4'd7: s_rdata <= {60'd0, o_cnt};       // how many of them are valid
+                // Every 32-bit value is REPLICATED into both halves of the 64-bit
+                // read word.  The interconnect places the value in the lane the
+                // address selects, so a register at an odd 32-bit offset used to
+                // read back as zeros - which is exactly what hung the loader here:
+                // LZ4_OSTAT at 0x1C always read 0, lz4_take8 never consumed, the
+                // staging stayed full and the decoder refused input forever.
+                // Replication is the standard way to serve a narrow register on a
+                // wide bus, and it makes every offset work.
+                4'd0: s_rdata <= {2{{27'd0, (~in_pending && in_ready), (o_cnt != 4'd0),
+                                     done_q, error_q, busy}}};
+                4'd6: s_rdata <= {2{o_stage[31:0]}};   // low half, replicated
+                4'd7: s_rdata <= {2{{28'd0, o_cnt}}};  // how many are valid
                 // The staged word is read as two 32-bit halves, not one 64-bit
                 // load: a 64-bit MMIO load never completes on this interconnect
                 // (no RVALID, core waits forever).  The high half lives at 0x08,
@@ -282,14 +294,14 @@ module lz4_mmio #(
                 // has ever decoded sits between 0x00 and 0x1C, and an address the
                 // interconnect does not route answers nothing, which hangs the
                 // core exactly the same way.  Stay inside the proven window.
-                4'd2: s_rdata <= {32'd0, o_stage[63:32]};
-                4'd3: s_rdata <= {32'd0, out_count};      // bytes produced
+                4'd2: s_rdata <= {2{o_stage[63:32]}};  // high half, replicated
+                4'd3: s_rdata <= {2{out_count}};          // bytes produced
                 // 0x10: what the decoder consumed, and whether it ever saw the
                 // end-of-block flag.  A short take_count means the wrapper lost
                 // input; a full one with the flag clear means the end was never
                 // signalled to the decoder.
-                4'd4: s_rdata <= {32'd0, take_count};
-                4'd5: s_rdata <= {30'd0, last_taken, started};
+                4'd4: s_rdata <= {2{take_count}};
+                4'd5: s_rdata <= {2{{30'd0, last_taken, started}}};
                 default: s_rdata <= '0;
                 endcase
             end
