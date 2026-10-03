@@ -176,8 +176,13 @@ module lz4_mmio #(
             // 11 097 600).  The write carries the count; the remainder shifts down
             // so the bytes that arrived keep their order.
             if (wr_hit && wr_reg == 4'd0 && s_wdata[1]) begin
-                o_cnt   <= o_cnt - s_wdata[7:4];
-                o_stage <= o_stage >> ({s_wdata[7:4], 3'b000});
+                // Back to clearing everything: the partial-consume variant (keep
+                // only what software read, shift the rest down) never passed the
+                // bench - it timed out - so it is not carried.  The 5% shortfall
+                // it was meant to fix stays open and documented, and this form is
+                // the one that runs on silicon.
+                o_cnt   <= 4'd0;
+                o_stage <= 64'd0;
             end
             if (dec_done)  done_q  <= 1'b1;
             if (dec_error) error_q <= 1'b1;
