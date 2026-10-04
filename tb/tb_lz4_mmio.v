@@ -53,13 +53,16 @@ module tb_lz4_mmio;
     // 8 staged bytes, read idempotently; the valid count; and consumption is an
     // explicit write to CTRL bit1 - never a side effect of the read.
     localparam [63:0] A_O64 = 64'h18, A_OSTAT = 64'h1C, A_O64HI = 64'h08;
+    localparam [63:0] A_INLEN = 64'h14;
 
     reg [7:0] input_bytes  [0:`IN_LEN-1];
     reg [7:0] expect_bytes [0:`EXP_LEN-1];
     reg [7:0] got_bytes    [0:`EXP_LEN-1];
 
     integer i, nout, errs, first_bad, k, wdog, extra, j, nv, draining, ready;
+    integer gi;
     reg [63:0] w64;
+    reg [63:0] iw;
     // Dedicated loop counters.  wdog is reset to 0 inside every axi_read, so a
     // wait loop that calls axi_read and tests wdog can never trip its own
     // bound: it would spin forever if the condition it waits on never comes.
@@ -142,15 +145,27 @@ module tb_lz4_mmio;
 
         axi_write(A_CTRL, 64'h1);                    // start a block
 
-        for (i = 0; i < `IN_LEN; i = i + 1) begin
-            // Wait until the decoder can take a byte.  This is the fix: without
-            // it, every write inside a long match destroys a waiting byte.
+        // Input is staged four bytes per write now.  The peripheral latches a
+        // 32-bit write into IN (0x04) and the decoder consumes one byte per
+        // handshake; a bench that still wrote one byte per store would stage
+        // three bytes of padding after every byte - it would not fail, it would
+        // quietly validate a different design.
+        //
+        // The end of the block is carried by the block length, written once via
+        // INLEN (0x14) after the start: four data bytes leave no bit for a
+        // per-byte end flag.  The final group is padded and the decoder stops on
+        // the length's last byte without consuming the padding.
+        axi_write(A_INLEN, `IN_LEN);
+        for (i = 0; i < `IN_LEN; i = i + 4) begin
+            // Wait until the input staging is empty (CTRL bit4).  This is the fix
+            // that has not changed in spirit: without a readiness gate, every
+            // write inside a long match would destroy staged bytes.
             // The bound has to cover the decoder's longest match: it takes no
             // input while copying, and giving up means writing anyway, which
-            // overwrites the pending byte and loses the following sequence.  A
-            // 40 000-byte match is ~80 000 cycles, about 3 000 iterations here.
-            // Generous is safe now that wcnt is a dedicated counter - the loop
-            // really does expire, and it drains while it waits.
+            // loses the following sequence.  A 40 000-byte match is ~80 000
+            // cycles, about 3 000 iterations here.  Generous is safe now that
+            // wcnt is a dedicated counter - the loop really does expire, and it
+            // drains while it waits.
             wcnt = 0; ready = 0;
             while (!ready && wcnt < 400000) begin
                 drain_once;                 // keep the staging moving while we wait
@@ -159,7 +174,14 @@ module tb_lz4_mmio;
                 wcnt = wcnt + 1;
             end
 
-            axi_write(A_IN, {55'd0, (i == `IN_LEN - 1), input_bytes[i]});
+            // Assemble the group: byte gi in bits [8*gi +: 8].  Bytes past the
+            // end of the stream are padding; they are never consumed because
+            // INLEN tells the decoder which byte is the block's last.
+            iw = 64'd0;
+            for (gi = 0; gi < 4; gi = gi + 1)
+                if (i + gi < `IN_LEN)
+                    iw = iw | ({56'd0, input_bytes[i + gi]} << (8 * gi));
+            axi_write(A_IN, iw);
 
             // Drain whatever is ready before moving on.  The delay before each
             // output read is the whole point: on silicon a register access costs

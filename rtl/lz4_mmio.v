@@ -29,7 +29,10 @@
 //    0x00  CTRL   W: bit0 = start a fresh block
 //                 R: bit0 busy, bit1 error, bit2 done,
 //                    bit3 = output byte available, bit4 = input accepted
-//    0x04  IN     W: [7:0] compressed byte, [8] = last byte of the block
+//    0x04  IN     W: [31:0] four compressed bytes, consumed one at a time
+//    0x14  INLEN  W: compressed block length; in_last is asserted on its last
+//                    byte.  Four data bytes fill a 32-bit write, so the end
+//                    cannot be a per-byte flag - the length carries it instead.
 //    0x08  OUT    R: [7:0] decompressed byte; reading releases the decoder
 //    0x0C  PROGRESS R: [31:16] bytes in, [15:0] bytes out
 //
@@ -98,11 +101,37 @@ module lz4_mmio #(
     end
 
     // ------------------------------------------------------------------
-    // Byte-at-a-time handshake to software
+    // Input staging: four compressed bytes per MMIO write
+    //
+    // Software used to write one byte per store - 2.79 M of them for the kernel
+    // - each followed by a busy-wait on CTRL.  The register window 0x00-0x1C is
+    // full and 0x20 was shown to be unrouted, so no new address is needed or
+    // available: the existing IN register at 0x04 already accepts a 32-bit
+    // write.  The four bytes it carries are staged here and the decoder eats
+    // them one at a time at its own rate, so the CPU's stores AND its polling
+    // both fall by four.
+    //
+    // END OF BLOCK.  A 32-bit write that already carries four data bytes has no
+    // spare bit for a per-byte end flag - four bytes plus four flags is 36 bits
+    // and does not fit, whatever field the flags are given.  So the end is not a
+    // per-write flag: the wrapper is told the block's compressed length once
+    // (INLEN, 0x14) and derives in_last from the number of bytes it has already
+    // consumed.  The final group is padded and the decoder stops on the right
+    // byte whatever its position in the group, which is why no valid-byte count
+    // is needed either.  INLEN must be written after the start write, because a
+    // start clears it.
+    //
+    // Lane note: this is a deliberate 32-bit write to 0x04, read from
+    // s_wdata[31:0].  Do NOT widen it to a 64-bit store to gain another factor:
+    // a 64-bit store on a 32-bit path arrives as two beats whose byte strobes
+    // say which bytes are live, and a peripheral that just reads s_wdata[31:0]
+    // drops the upper half silently.
     // ------------------------------------------------------------------
-    logic        in_pending;      // a byte is waiting for the decoder
-    logic [7:0]  in_byte;
-    logic        in_last_q;
+    logic [31:0] i_stage;   // staged compressed bytes; byte 0 is consumed next
+    logic [2:0]  i_cnt;     // staged bytes not yet consumed, 0..4
+    logic [31:0] i_len;     // compressed block length; in_last fires on its last byte
+    wire  [7:0]  in_byte   = i_stage[7:0];
+    wire         in_last_q = (take_count == (i_len - 32'd1));
     logic        in_ready, out_valid;
     logic [7:0]  out_data;
     // Output is staged 8 bytes at a time.  The old scheme made reading OUT
@@ -136,19 +165,34 @@ module lz4_mmio #(
 
     wire busy = started & ~done_q & ~error_q;
 
-    // The decoder takes the pending byte exactly when it says it is ready.
-    wire dec_takes = in_pending && in_ready;
+    // Room for the decoder's next byte, counting the one already in flight.
+    // The decoder decides to emit at cycle N when out_ready is high, but
+    // out_valid rises at N+1 - by which time o_cnt has been advanced by the
+    // previous pulse.  A plain (o_cnt < 8) therefore lets the decoder emit one
+    // byte too many, for which the staging register has no room: the byte is
+    // DROPPED silently, once per time the staging saturates, and the stream is
+    // short by that many bytes with no error flagged.  Measured on the real
+    // kernel prefix: 7 drops over 12 008 output bytes.  The in-flight byte must
+    // be counted here.
+    wire out_ready = ((o_cnt + {3'd0, out_valid}) < 4'd8);
+
+    // Staging is non-empty exactly when a byte is presented to the decoder.
+    wire in_valid = (i_cnt != 3'd0);
+
+    // The decoder takes the staged byte at position 0 exactly when it says it
+    // is ready.
+    wire dec_takes = in_valid && in_ready;
 
     lz4_decoder u_dec (
         .clk        (clk),
         .rst_n      (rst_n),
         .in_data    (in_byte),
-        .in_valid   (in_pending),
+        .in_valid   (in_valid),
         .in_last    (in_last_q),
         .in_ready   (in_ready),
         .out_data   (out_data),
         .out_valid  (out_valid),
-        .out_ready  (o_cnt < 4'd8), // room in the staging register
+        .out_ready  (out_ready),    // counts the byte already in flight
         .win_waddr  (win_waddr),
         .win_wdata  (win_wdata),
         .win_we     (win_we),
@@ -160,7 +204,7 @@ module lz4_mmio #(
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            in_pending <= 1'b0; in_byte <= 8'd0; in_last_q <= 1'b0;
+            i_stage <= 32'd0; i_cnt <= 3'd0; i_len <= 32'd0;
             o_stage <= 64'd0; o_cnt <= 4'd0;
             snap <= 64'd0; snap_n <= 4'd0; snap_v <= 1'b0;
             done_q <= 1'b0; error_q <= 1'b0; started <= 1'b0;
@@ -168,7 +212,8 @@ module lz4_mmio #(
             take_count <= 32'd0; last_taken <= 1'b0;
         end else begin
             if (dec_takes) begin
-                in_pending <= 1'b0;
+                i_stage    <= i_stage >> 8;   // drop the byte just consumed
+                i_cnt      <= i_cnt - 3'd1;
                 take_count <= take_count + 32'd1;
                 last_taken <= in_last_q;      // sticky: did the end flag ever land
             end
@@ -210,18 +255,23 @@ module lz4_mmio #(
                     done_q     <= 1'b0;
                     error_q    <= 1'b0;
                     o_cnt      <= 4'd0;
-                    in_pending <= 1'b0;
+                    i_stage    <= 32'd0;
+                    i_cnt      <= 3'd0;
+                    i_len      <= 32'd0;
                     in_count   <= 32'd0;
                     out_count  <= 32'd0;
                     take_count <= 32'd0;
                     last_taken <= 1'b0;
                 end
                 4'd1: begin
-                    in_byte    <= s_wdata[7:0];
-                    in_last_q  <= s_wdata[8];
-                    in_pending <= 1'b1;
-                    in_count   <= in_count + 32'd1;
+                    i_stage  <= s_wdata[31:0];   // four compressed bytes at once
+                    i_cnt    <= 3'd4;
+                    in_count <= in_count + 32'd4;
                 end
+                // Compressed block length.  Written once, after the start write,
+                // so the wrapper can assert in_last on the right byte - there is
+                // no room for a per-byte end flag in the 32-bit IN write.
+                4'd5: i_len <= s_wdata[31:0];
                 default: ;
                 endcase
             end
@@ -291,10 +341,13 @@ module lz4_mmio #(
                 s_rlast   <= 1'b1;
                 rd_reg    <= s_araddr[5:2];
                 case (s_araddr[5:2])
-                // bit4 = "writing a byte now will be taken", which is NOT the
-                // same as "no byte is pending": inside a match the decoder owes
-                // no byte yet wants none, and a write then would be overwritten
-                // at the next clock.  Readiness is the decoder actually asking.
+                // bit4 = "the input staging is empty, a four-byte write will be
+                // kept".  With four bytes staged, this is the only condition
+                // that matters: a write while staging is non-empty would drop
+                // whatever the decoder has not yet consumed.  It deliberately no
+                // longer asks whether the decoder is ready right now - writing
+                // while it is busy inside a match is harmless, the staged bytes
+                // simply wait - which is what removes one poll in four.
                 // Every 32-bit value is REPLICATED into both halves of the 64-bit
                 // read word.  The interconnect places the value in the lane the
                 // address selects, so a register at an odd 32-bit offset used to
@@ -303,7 +356,7 @@ module lz4_mmio #(
                 // staging stayed full and the decoder refused input forever.
                 // Replication is the standard way to serve a narrow register on a
                 // wide bus, and it makes every offset work.
-                4'd0: s_rdata <= {2{{27'd0, (~in_pending && in_ready), (o_cnt != 4'd0),
+                4'd0: s_rdata <= {2{{27'd0, (i_cnt == 3'd0), (o_cnt != 4'd0),
                                      done_q, error_q, busy}}};
                 4'd6: s_rdata <= {2{(snap_v ? snap[31:0] : o_stage[31:0])}};  // low half, frozen group
                 4'd7: s_rdata <= {2{{28'd0, o_cnt}}};  // size, and this read freezes the group

@@ -44,26 +44,43 @@ one cycle only.
 
 - **`lz4_decoder.v`** - the decoder itself: byte in, byte out, window external.
 - **`lz4_mmio.v`** - the same decoder as an AXI4-Lite peripheral for firmware to
-  drive byte at a time, carrying its own 64 KiB window.
+  drive four compressed bytes at a time, carrying its own 64 KiB window.
 
 ### Register map of the MMIO wrapper
 
 | offset | access | meaning |
 |---|---|---|
-| `0x00` | W | bit0: start a fresh block (clears done/error) |
-| `0x00` | R | bit0 busy, bit1 error, bit2 done, bit3 output byte available |
-| `0x04` | W | `[7:0]` compressed byte, `[8]` = last byte of the block |
-| `0x08` | R | `[7:0]` decompressed byte; reading releases the decoder |
-| `0x0C` | R | `[15:0]` decompressed bytes produced |
+| `0x00` | W | bit0: start a fresh block (clears done/error); bit1: consume the staged output group |
+| `0x00` | R | bit0 busy, bit1 error, bit2 done, bit3 output group available, bit4 input staging empty |
+| `0x04` | W | `[31:0]` four compressed bytes, consumed one at a time |
+| `0x08` | R | high half of the staged output word (two 32-bit reads, never one 64-bit load) |
+| `0x0C` | R | bytes the decoder produced |
+| `0x10` | R | bytes the decoder consumed |
+| `0x14` | W | compressed block length (INLEN); `in_last` fires on its last byte |
+| `0x14` | R | `[0]` started, `[1]` the end flag ever reached the decoder |
+| `0x18` | R | low half of the staged output word |
+| `0x1C` | R | `[3:0]` valid bytes in the staged word; reading freezes the group |
 
-Firmware writes a byte, polls bit3, reads the byte, repeats - the CPU stays in
-the loop between bytes but out of the inner loop, which is what removes the
-instruction-fetch cost the software decoder paid once per instruction.
+Firmware writes four compressed bytes per store and polls bit4 before each; the
+decoder eats them one at a time.  On the output side it reads the staged group
+idempotently (count, two halves) and consumes it with an explicit write, so no
+read has a side effect.  The CPU stays out of the decoder's inner loop, which is
+what removes the instruction-fetch cost the software decoder paid once per
+instruction.  The 32-bit note is not stylistic: a 64-bit MMIO load never
+completes on this interconnect, and a 64-bit store arrives as two beats whose
+byte strobes decide which bytes are live.
 
 ### Cost, measured
 
-`lz4_mmio` on `xcku5p-ffvb676-1-i`: **277 CLB LUTs, 291 registers, 16 BRAM36
-tiles** - 0.13 % and 3.3 % of the device.
+`lz4_mmio` on `xcku5p-ffvb676-1-i`, Vivado 2025.2 `synth_1`, with the input
+staging and the in-flight output-room fix: **641 CLB LUTs, 505 registers, 16
+BRAM36 tiles** - 0.30 % and 3.3 % of the device.
+
+The staging cost **+80 LUTs and +57 registers** over the byte-at-a-time wrapper
+(561 / 448 measured the same way at `43e79ec`): the 32-bit input staging, the
+INLEN counter, and the corrected output room test.  The BRAM count does not
+move.  (The 277 LUT / 291 register figure quoted in earlier revisions predates
+the staged output; it is not the cost of the current design.)
 
 The BRAM count is not an accident of the tool: it requires the window read to be
 **registered**.  A combinational read still passes simulation and is more
