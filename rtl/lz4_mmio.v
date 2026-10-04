@@ -113,6 +113,16 @@ module lz4_mmio #(
     // write, so a re-read cannot duplicate anything.
     logic [63:0] o_stage;
     logic [3:0]  o_cnt;      // valid bytes in o_stage, 0..8
+    // Snapshot taken when software reads the count.  The three accesses that make
+    // up a take - count, data, consume - must describe the SAME bytes; without
+    // this the decoder stages more in between and the consume, which clears
+    // everything, drops them.  That is the 5% the loader measured (10 540 334
+    // against 11 097 600).  With the snapshot the data served is the data
+    // counted, and the consume removes exactly that many bytes.
+    logic [63:0] snap;
+    logic [3:0]  snap_n;
+    logic        snap_v;
+    wire  rd_cnt  = rd_hit && (s_araddr[5:2] == 4'd7);
     logic        dec_done, dec_error;
     logic        done_q, error_q, started;
     logic [31:0] in_count, out_count;
@@ -152,6 +162,7 @@ module lz4_mmio #(
         if (!rst_n) begin
             in_pending <= 1'b0; in_byte <= 8'd0; in_last_q <= 1'b0;
             o_stage <= 64'd0; o_cnt <= 4'd0;
+            snap <= 64'd0; snap_n <= 4'd0; snap_v <= 1'b0;
             done_q <= 1'b0; error_q <= 1'b0; started <= 1'b0;
             in_count <= 32'd0; out_count <= 32'd0;
             take_count <= 32'd0; last_taken <= 1'b0;
@@ -175,14 +186,19 @@ module lz4_mmio #(
             // the 5% shortfall the loader reported (10 540 334 bytes against
             // 11 097 600).  The write carries the count; the remainder shifts down
             // so the bytes that arrived keep their order.
+            // Freeze the group when software asks for its size, so the data it
+            // then reads is the data it counted.
+            if (rd_cnt) begin
+                snap   <= o_stage;
+                snap_n <= o_cnt;
+                snap_v <= 1'b1;
+            end
+            // Consume exactly the bytes the snapshot held.  Anything the decoder
+            // staged since stays, shifted down, and is read on the next take.
             if (wr_hit && wr_reg == 4'd0 && s_wdata[1]) begin
-                // Back to clearing everything: the partial-consume variant (keep
-                // only what software read, shift the rest down) never passed the
-                // bench - it timed out - so it is not carried.  The 5% shortfall
-                // it was meant to fix stays open and documented, and this form is
-                // the one that runs on silicon.
-                o_cnt   <= 4'd0;
-                o_stage <= 64'd0;
+                o_cnt   <= (o_cnt >= snap_n) ? (o_cnt - snap_n) : 4'd0;
+                o_stage <= o_stage >> ({snap_n, 3'b000});
+                snap_v  <= 1'b0;
             end
             if (dec_done)  done_q  <= 1'b1;
             if (dec_error) error_q <= 1'b1;
@@ -289,8 +305,8 @@ module lz4_mmio #(
                 // wide bus, and it makes every offset work.
                 4'd0: s_rdata <= {2{{27'd0, (~in_pending && in_ready), (o_cnt != 4'd0),
                                      done_q, error_q, busy}}};
-                4'd6: s_rdata <= {2{o_stage[31:0]}};   // low half, replicated
-                4'd7: s_rdata <= {2{{28'd0, o_cnt}}};  // how many are valid
+                4'd6: s_rdata <= {2{(snap_v ? snap[31:0] : o_stage[31:0])}};  // low half, frozen group
+                4'd7: s_rdata <= {2{{28'd0, o_cnt}}};  // size, and this read freezes the group
                 // The staged word is read as two 32-bit halves, not one 64-bit
                 // load: a 64-bit MMIO load never completes on this interconnect
                 // (no RVALID, core waits forever).  The high half lives at 0x08,
@@ -299,7 +315,7 @@ module lz4_mmio #(
                 // has ever decoded sits between 0x00 and 0x1C, and an address the
                 // interconnect does not route answers nothing, which hangs the
                 // core exactly the same way.  Stay inside the proven window.
-                4'd2: s_rdata <= {2{o_stage[63:32]}};  // high half, replicated
+                4'd2: s_rdata <= {2{(snap_v ? snap[63:32] : o_stage[63:32])}}; // high half, frozen group
                 4'd3: s_rdata <= {2{out_count}};          // bytes produced
                 // 0x10: what the decoder consumed, and whether it ever saw the
                 // end-of-block flag.  A short take_count means the wrapper lost
