@@ -3,7 +3,7 @@
 // ============================================================================
 //  tb_lz4_mmio.v - AXI-level self-checking testbench for lz4_mmio
 // ----------------------------------------------------------------------------
-//  Drives the peripheral the way firmware will: start a block, wait until CTRL
+//  Drives the peripheral the way firmware does: start a block, wait until CTRL
 //  says the decoder can accept a byte, write it, collect output, repeat.
 //
 //  The wait on bit 4 is the whole point.  The decoder does not consume input
@@ -12,6 +12,11 @@
 //  byte of that match.  The first version had no such bit and produced a
 //  corrupted 13 190 715-byte "kernel" with no error flagged.  A testbench that
 //  ignores bit 4 would certify exactly that bug, so it is checked, not assumed.
+//
+//  OUTPUT DRAIN is the auto-increment group FIFO: read 0x1C for the number of
+//  whole groups ready (once per batch, amortised), then for each group read the
+//  low half at 0x18 (idempotent) and the high half at 0x08 (which pops the group).
+//  Two accesses per 8-byte group plus one count read per batch.
 //
 //  iverilog -g2012 -o tb_mmio tb_lz4_mmio.v lz4_mmio.v lz4_decoder.v && vvp tb_mmio
 // ============================================================================
@@ -49,9 +54,11 @@ module tb_lz4_mmio;
     );
 
     localparam [63:0] A_CTRL = 64'h00, A_IN = 64'h04, A_OUT = 64'h08;
-    localparam [63:0] A_PRODUCED = 64'h0C, A_TAKEN = 64'h10, A_FLAGS = 64'h14;
-    // 8 staged bytes, read idempotently; the valid count; and consumption is an
-    // explicit write to CTRL bit1 - never a side effect of the read.
+    localparam [63:0] A_PRODUCED = 64'h0C, A_TAKEN = 64'h10, A_GC = 64'h14;
+    // The FIFO head group: low half at 0x18 (idempotent), high half at 0x08
+    // (reading it pops the group); the whole-group count and the two input flags
+    // are at 0x1C.  Consumption is the high-half read itself - there is no
+    // explicit consume write any more.
     localparam [63:0] A_O64 = 64'h18, A_OSTAT = 64'h1C, A_O64HI = 64'h08;
     localparam [63:0] A_INLEN = 64'h14;
 
@@ -61,12 +68,15 @@ module tb_lz4_mmio;
 
     integer i, nout, errs, first_bad, k, wdog, extra, j, nv, draining, ready;
     integer gi;
+    integer wcnt, dcnt;
+    integer nacq;               // all MMIO accesses (one per load / store)
+    integer ndrain;             // accesses issued by the output drain alone
+    integer ncall, ncall_ne, nsum, nmax;   // batch statistics
+    integer lat;                // modelled CPU cost per MMIO access, in clocks
     reg [63:0] w64;
     reg [63:0] iw;
-    // Dedicated loop counters.  wdog is reset to 0 inside every axi_read, so a
-    // wait loop that calls axi_read and tests wdog can never trip its own
-    // bound: it would spin forever if the condition it waits on never comes.
-    integer wcnt, dcnt;
+    reg [31:0] produced, gtaken;
+    reg        done_seen;
     reg [1023:0] verdict;
     reg [63:0] rd_value;
 
@@ -91,6 +101,8 @@ module tb_lz4_mmio;
             wdog = 0;
             while (s_bvalid !== 1'b1 && wdog < 256) begin @(negedge clk); wdog = wdog + 1; end
             @(posedge clk);
+            nacq = nacq + 1;
+            repeat (lat) @(posedge clk);
         end
     endtask
 
@@ -107,30 +119,33 @@ module tb_lz4_mmio;
             while (s_rvalid !== 1'b1 && wdog < 256) begin @(negedge clk); wdog = wdog + 1; end
             rd_value = s_rdata;
             @(posedge clk);
+            nacq = nacq + 1;
+            repeat (lat) @(posedge clk);
         end
     endtask
 
-    // Take one staged group: read the valid count, read the word, consume it with
-    // an explicit write.  Factored out because it has to run *inside* the
-    // readiness wait too: once 8 bytes are staged the decoder's out_ready drops,
-    // so a wait that does not drain leaves the decoder stalled and the bench
-    // spins its whole bound on every single input byte.
-    task drain_once;
+    // Drain every whole group currently in the FIFO.  One status read gives the
+    // count; then each group is two 32-bit halves - the low half idempotent, the
+    // high half popping the group.  This is the 1 + 2G protocol the design note
+    // describes, and it is the same shape firmware uses.
+    task drain_ready;
+        integer n, g, jj;
         begin
-            axi_read(A_OSTAT);
-            if (rd_value[3:0] != 0) begin
-                nv = rd_value[3:0];
-                // two 32-bit reads, matching what the loader must do: a 64-bit
-                // MMIO load never completes on this interconnect
-                axi_read(A_O64);   w64[31:0]  = rd_value[31:0];
-                axi_read(A_O64HI); w64[63:32] = rd_value[31:0];
-                for (j = 0; j < 8; j = j + 1)
-                    if (j < nv) begin
-                        if (nout < `EXP_LEN) got_bytes[nout] = w64[8*j +: 8];
-                        else extra = extra + 1;
-                        nout = nout + 1;
-                    end
-                axi_write(A_CTRL, 64'h2);
+            axi_read(A_OSTAT); ndrain = ndrain + 1;
+            n = rd_value[3:0];
+            ncall = ncall + 1;
+            if (n > 0) begin ncall_ne = ncall_ne + 1; nsum = nsum + n; end
+            if (n > nmax) nmax = n;
+            for (g = 0; g < n; g = g + 1) begin
+                axi_read(A_O64);   ndrain = ndrain + 1;           // 0x18 low
+                w64[31:0]  = rd_value[31:0];
+                axi_read(A_O64HI); ndrain = ndrain + 1;           // 0x08 high, pops
+                w64[63:32] = rd_value[31:0];
+                for (jj = 0; jj < 8; jj = jj + 1) begin
+                    if (nout < `EXP_LEN) got_bytes[nout] = w64[8*jj +: 8];
+                    else extra = extra + 1;
+                    nout = nout + 1;
+                end
             end
         end
     endtask
@@ -138,39 +153,31 @@ module tb_lz4_mmio;
     initial begin
         $readmemh("in.hex", input_bytes);
         $readmemh("exp.hex", expect_bytes);
-        nout = 0; errs = 0; first_bad = -1; extra = 0;
+        if (!$value$plusargs("lat=%d", lat)) lat = 0;
+        nout = 0; errs = 0; first_bad = -1; extra = 0; nacq = 0;
+        ndrain = 0; ncall = 0; ncall_ne = 0; nsum = 0; nmax = 0;
         repeat (6) @(posedge clk);
         rst_n = 1'b1;
         repeat (4) @(posedge clk);
 
         axi_write(A_CTRL, 64'h1);                    // start a block
 
-        // Input is staged four bytes per write now.  The peripheral latches a
-        // 32-bit write into IN (0x04) and the decoder consumes one byte per
-        // handshake; a bench that still wrote one byte per store would stage
-        // three bytes of padding after every byte - it would not fail, it would
-        // quietly validate a different design.
-        //
-        // The end of the block is carried by the block length, written once via
-        // INLEN (0x14) after the start: four data bytes leave no bit for a
-        // per-byte end flag.  The final group is padded and the decoder stops on
-        // the length's last byte without consuming the padding.
+        // Input is staged four bytes per write.  The end of the block is carried
+        // by the block length, written once via INLEN (0x14) after the start.
         axi_write(A_INLEN, `IN_LEN);
         for (i = 0; i < `IN_LEN; i = i + 4) begin
-            // Wait until the input staging is empty (CTRL bit4).  This is the fix
-            // that has not changed in spirit: without a readiness gate, every
-            // write inside a long match would destroy staged bytes.
-            // The bound has to cover the decoder's longest match: it takes no
-            // input while copying, and giving up means writing anyway, which
-            // loses the following sequence.  A 40 000-byte match is ~80 000
-            // cycles, about 3 000 iterations here.  Generous is safe now that
-            // wcnt is a dedicated counter - the loop really does expire, and it
-            // drains while it waits.
+            // Wait until the input staging is empty (CTRL bit4).  While it is
+            // NOT empty the decoder is back-pressured (its output buffer is
+            // full), so that is the moment to drain - and only then.  Draining
+            // on every write instead would keep the FIFO nearly empty and throw
+            // away the run-ahead the FIFO exists for; the whole point of the
+            // FIFO is that the decoder may sit 72 bytes ahead of the CPU.  A
+            // bound covers the decoder's longest match.
             wcnt = 0; ready = 0;
             while (!ready && wcnt < 400000) begin
-                drain_once;                 // keep the staging moving while we wait
                 axi_read(A_CTRL);
-                if (rd_value[4]) ready = 1;
+                if (rd_value[4]) ready = 1;          // staging empty: write now
+                else if (rd_value[3]) drain_ready;   // blocked: bank a full batch
                 wcnt = wcnt + 1;
             end
 
@@ -182,57 +189,30 @@ module tb_lz4_mmio;
                 if (i + gi < `IN_LEN)
                     iw = iw | ({56'd0, input_bytes[i + gi]} << (8 * gi));
             axi_write(A_IN, iw);
-
-            // Drain whatever is ready before moving on.  The delay before each
-            // output read is the whole point: on silicon a register access costs
-            // 50-90 cycles while this bench used a handful, so the decoder was
-            // never actually made to wait on a full output holding register.  That
-            // stall path is where silicon emits every byte twice, and a bench that
-            // drains at full speed cannot see it.
-            dcnt = 0; draining = 1;
-            while (draining && dcnt < 64) begin
-                axi_read(A_OSTAT);
-                if (rd_value[3:0] == 0) draining = 0;
-                else begin drain_once; dcnt = dcnt + 1; end
-            end
         end
 
         // Drain the remainder and wait for done.
-        wdog = 0;
-        // Same reasoning: each pass costs several AXI accesses, and the tail
-        // after the last input byte is at most one staged group.
-        dcnt = 0;
-        while (!rd_value[2] && dcnt < 20000) begin
+        done_seen = 1'b0; dcnt = 0;
+        while (!done_seen && dcnt < 2000000) begin
             axi_read(A_CTRL);
-            axi_read(A_OSTAT);
-            if (rd_value[3:0] != 0) begin
-                nv = rd_value[3:0];
-                // two 32-bit reads, matching what the loader must do: a 64-bit
-                // MMIO load never completes on this interconnect
-                axi_read(A_O64);   w64[31:0]  = rd_value[31:0];
-                axi_read(A_O64HI); w64[63:32] = rd_value[31:0];
-                for (j = 0; j < 8; j = j + 1)
-                    if (j < nv) begin
-                        if (nout < `EXP_LEN) got_bytes[nout] = w64[8*j +: 8];
-                        else extra = extra + 1;
-                        nout = nout + 1;
-                    end
-                axi_write(A_CTRL, 64'h2);
-            end
+            done_seen = rd_value[2];
+            drain_ready;
             dcnt = dcnt + 1;
         end
 
-        // `done` may assert with a final group still staged, so take it
-        // unconditionally: the last bytes of the stream are exactly that group.
-        draining = 1;
-        while (draining) begin
+        // `done` may assert with a final group still staged; take everything.
+        draining = 1; dcnt = 0;
+        while (draining && dcnt < 200000) begin
             axi_read(A_OSTAT);
             if (rd_value[3:0] == 0) draining = 0;
-            else drain_once;
+            else drain_ready;
+            dcnt = dcnt + 1;
         end
 
         axi_read(A_CTRL);
         if (rd_value[1]) errs = errs + 1;            // bit1 = error
+        axi_read(A_PRODUCED); produced = rd_value[31:0];
+        axi_read(A_GC);       gtaken   = rd_value[31:0];
 
         for (k = 0; k < `EXP_LEN; k = k + 1)
             if (got_bytes[k] !== expect_bytes[k]) begin
@@ -248,7 +228,22 @@ module tb_lz4_mmio;
         $display("--------------------------------------------------");
         $display("  compressed     : %0d", `IN_LEN);
         $display("  decompressed   : %0d of %0d expected", nout, `EXP_LEN);
-        $display("  extra past end : %0d   (silicon produced 2 093 115)", extra);
+        $display("  extra past end : %0d", extra);
+        $display("  MMIO accesses  : %0d total, %0d in the output drain", nacq, ndrain);
+        $display("  drain/group    : %0d.%02d   (%0d groups)",
+                 ndrain / (`EXP_LEN / 8), ((ndrain * 100) / (`EXP_LEN / 8)) % 100,
+                 `EXP_LEN / 8);
+        $display("  total/group    : %0d.%02d",
+                 nacq / (`EXP_LEN / 8), ((nacq * 100) / (`EXP_LEN / 8)) % 100);
+        $display("  drain/byte     : %0d.%03d", ndrain / `EXP_LEN,
+                 ((ndrain * 1000) / `EXP_LEN) % 1000);
+        $display("  batch G        : mean %0d.%02d over %0d non-empty reads, max %0d",
+                 (ncall_ne ? nsum / ncall_ne : 0),
+                 (ncall_ne ? ((nsum * 100) / ncall_ne) % 100 : 0),
+                 ncall_ne, nmax);
+        $display("  access model   : %0d clocks per MMIO access", lat);
+        $display("  produced=%0d  groups_taken=%0d  (x8 = %0d)",
+                 produced, gtaken, gtaken * 8);
         if (first_bad >= 0)
             $display("  first mismatch : byte %0d  got %02x  expected %02x",
                      first_bad, got_bytes[first_bad], expect_bytes[first_bad]);

@@ -50,31 +50,48 @@ one cycle only.
 
 | offset | access | meaning |
 |---|---|---|
-| `0x00` | W | bit0: start a fresh block (clears done/error); bit1: consume the staged output group |
-| `0x00` | R | bit0 busy, bit1 error, bit2 done, bit3 output group available, bit4 input staging empty |
+| `0x00` | W | bit0: start a fresh block (clears done/error) |
+| `0x00` | R | bit0 busy, bit1 error, bit2 done, bit3 an output group is available, bit4 input staging empty |
 | `0x04` | W | `[31:0]` four compressed bytes, consumed one at a time |
-| `0x08` | R | high half of the staged output word (two 32-bit reads, never one 64-bit load) |
+| `0x08` | R | high half of the head output group; **reading it pops the group** (the auto-increment) |
 | `0x0C` | R | bytes the decoder produced |
-| `0x10` | R | bytes the decoder consumed |
+| `0x10` | R | bytes the decoder consumed from the input staging |
 | `0x14` | W | compressed block length (INLEN); `in_last` fires on its last byte |
-| `0x14` | R | `[0]` started, `[1]` the end flag ever reached the decoder |
-| `0x18` | R | low half of the staged output word |
-| `0x1C` | R | `[3:0]` valid bytes in the staged word; reading freezes the group |
+| `0x14` | R | groups software has consumed (the lost-group instrument) |
+| `0x18` | R | low half of the head output group; idempotent, does not pop |
+| `0x1C` | R | `[3:0]` whole 8-byte groups ready, `[4]` started, `[5]` the end flag ever reached the decoder |
 
 Firmware writes four compressed bytes per store and polls bit4 before each; the
-decoder eats them one at a time.  On the output side it reads the staged group
-idempotently (count, two halves) and consumes it with an explicit write, so no
-read has a side effect.  The CPU stays out of the decoder's inner loop, which is
-what removes the instruction-fetch cost the software decoder paid once per
-instruction.  The 32-bit note is not stylistic: a 64-bit MMIO load never
-completes on this interconnect, and a 64-bit store arrives as two beats whose
-byte strobes decide which bytes are live.
+decoder eats them one at a time.  On the output side the peripheral keeps a FIFO
+of frozen 8-byte groups and the CPU drains it with an auto-increment: read `0x1C`
+for the number of whole groups ready, then each group as a low half (`0x18`) and
+a high half (`0x08`), the high-half read committing the group.  That is one count
+read plus two data reads per group, against the old count + two data + consume
+write - **2.12 accesses per 8-byte group measured when the FIFO is full, against
+4.0**.  The CPU stays out of the decoder's inner loop, which is what removes the
+instruction-fetch cost the software decoder paid once per instruction.  The
+32-bit note is not stylistic: a 64-bit MMIO load never completes on this
+interconnect, and a 64-bit store arrives as two beats whose byte strobes decide
+which bytes are live.
+
+The auto-increment is **not idempotent**: a retried or fault-interrupted `0x08`
+read advances past the next group, where the old freeze-plus-consume protocol's
+repeated read was harmless.  This is stated in the source; `0x14` counts the
+groups software has popped, so a lost group is detectable against `0x0C`, and the
+boot loader runs with interrupts off and no fault path, which bounds the exposure
+for this boot path.
 
 ### Cost, measured
 
 `lz4_mmio` on `xcku5p-ffvb676-1-i`, Vivado 2025.2 `synth_1`, with the input
 staging and the in-flight output-room fix: **641 CLB LUTs, 505 registers, 16
 BRAM36 tiles** - 0.30 % and 3.3 % of the device.
+
+The auto-increment output FIFO costs **713 CLB LUTs, 991 registers, 16 BRAM36
+tiles** - **+72 LUTs, +486 registers, no BRAM change** against 641/505/16.  The
+486 registers are the 8 x 64-bit group FIFO (one flop per bit; Vivado kept it in
+registers rather than distributing it), less the count/snapshot logic it replaced.
+The window, and so the BRAM count, is untouched.
 
 The staging cost **+80 LUTs and +57 registers** over the byte-at-a-time wrapper
 (561 / 448 measured the same way at `43e79ec`): the 32-bit input staging, the

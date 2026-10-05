@@ -28,13 +28,21 @@
 //  Register map (word index = addr[5:2]):
 //    0x00  CTRL   W: bit0 = start a fresh block
 //                 R: bit0 busy, bit1 error, bit2 done,
-//                    bit3 = output byte available, bit4 = input accepted
+//                    bit3 = an output group is available, bit4 = input staging empty
 //    0x04  IN     W: [31:0] four compressed bytes, consumed one at a time
 //    0x14  INLEN  W: compressed block length; in_last is asserted on its last
 //                    byte.  Four data bytes fill a 32-bit write, so the end
 //                    cannot be a per-byte flag - the length carries it instead.
-//    0x08  OUT    R: [7:0] decompressed byte; reading releases the decoder
-//    0x0C  PROGRESS R: [31:16] bytes in, [15:0] bytes out
+//    0x18  OLO    R: low  32 bits of the output FIFO head group.  Idempotent:
+//                    re-reading it does NOT advance the FIFO.
+//    0x08  OHI    R: high 32 bits of the head group.  Reading it COMPLETES the
+//                    pair and pops (commits) that group - this is the auto-
+//                    increment.  It is not idempotent: see the trade below.
+//    0x1C  OSTAT  R: [3:0] whole 8-byte groups ready in the FIFO, [4] started,
+//                    [5] the end flag ever reached the decoder.  No side effect.
+//    0x14  GC     R: groups software has consumed (a lost group is detectable).
+//    0x0C  PROGRESS R: [31:0] bytes the decoder produced
+//    0x10  TAKEN  R: bytes the decoder consumed from the input staging
 //
 //  Window: 64 KiB of block RAM inside the peripheral.  The read is REGISTERED -
 //  that is the decoder's stated contract and it is also what lets Vivado infer
@@ -134,24 +142,6 @@ module lz4_mmio #(
     wire         in_last_q = (take_count == (i_len - 32'd1));
     logic        in_ready, out_valid;
     logic [7:0]  out_data;
-    // Output is staged 8 bytes at a time.  The old scheme made reading OUT
-    // destructive: the byte was released by the read itself, cleared by an
-    // access-derived condition, and every bug in this peripheral came out of
-    // that (a clear one access late duplicated every literal).  Reading the
-    // staged word is now idempotent and software advances with an explicit
-    // write, so a re-read cannot duplicate anything.
-    logic [63:0] o_stage;
-    logic [3:0]  o_cnt;      // valid bytes in o_stage, 0..8
-    // Snapshot taken when software reads the count.  The three accesses that make
-    // up a take - count, data, consume - must describe the SAME bytes; without
-    // this the decoder stages more in between and the consume, which clears
-    // everything, drops them.  That is the 5% the loader measured (10 540 334
-    // against 11 097 600).  With the snapshot the data served is the data
-    // counted, and the consume removes exactly that many bytes.
-    logic [63:0] snap;
-    logic [3:0]  snap_n;
-    logic        snap_v;
-    wire  rd_cnt  = rd_hit && (s_araddr[5:2] == 4'd7);
     logic        dec_done, dec_error;
     logic        done_q, error_q, started;
     logic [31:0] in_count, out_count;
@@ -163,7 +153,56 @@ module lz4_mmio #(
     logic [31:0] take_count;
     logic        last_taken;
 
-    wire busy = started & ~done_q & ~error_q;
+    // ------------------------------------------------------------------
+    // Output: a FIFO of frozen 8-byte groups, drained by auto-increment
+    //
+    // The old drain cost FOUR MMIO accesses per 8-byte group: read the size
+    // (0x1C, which also froze the group), read the low half (0x18), read the
+    // high half (0x08) and write CTRL bit1 to consume.  Measured on the kernel
+    // stream that is 1 387 200 groups x 4 = 5 548 800 accesses for 11 097 600
+    // bytes, and it is ~98 % of the 7 060 ms the stage takes (the decoder itself
+    // needs ~433 ms).
+    //
+    // Here the frozen single group becomes a FIFO of DEPTH frozen groups, so the
+    // count read amortises over a whole batch and the consume write disappears:
+    //
+    //     read 0x1C      how many whole groups are ready (once per batch)
+    //     read 0x18      low half  - advances nothing, safe to retry
+    //     read 0x08      high half - completes the pair and pops the group
+    //
+    // For a batch of G groups that is 1 + 2G accesses for 8G bytes - 2.0 per
+    // group as G grows, the factor of two.  The decoder also runs ahead: out_ready
+    // stays high until the FIFO AND the byte accumulator are both full, so it is
+    // buffered (DEPTH+1)*8 bytes past the CPU instead of stopping at 8.
+    //
+    // THE HONEST TRADE.  The old freeze-plus-explicit-consume protocol was safe
+    // under retry: a repeated read returned the same bytes and consumption only
+    // happened on an explicit write.  The 0x08 read is NOT idempotent - a retried
+    // or fault-interrupted 0x08 read pops the next group as well, so it silently
+    // advances past data (the loss class of failure).  Three things buy the
+    // safety back as far as it can be bought:
+    //   * the low half (0x18) has no side effect, so only the high half commits;
+    //   * groups_taken (readable at 0x14) counts the groups software has popped,
+    //     the same instrument role take_count plays for the input, so a lost
+    //     group is DETECTABLE (groups_taken x 8 + tail should equal out_count);
+    //   * the boot loader runs with interrupts off and no fault path, so the
+    //     exposure is bounded for this boot path - stated explicitly, not left
+    //     implicit.
+    // A group is frozen into the FIFO when the byte accumulator fills (8 bytes),
+    // and the final partial group is pushed once the decoder asserts done; the
+    // number of bytes in that last group is out_count mod 8 (out_count, 0x0C, is
+    // the decoder's own byte total), so no separate OLEN register is needed and
+    // no new address is used - the proven 0x00-0x1C window is respected.
+    // ------------------------------------------------------------------
+    localparam integer OGRP = 8;    // FIFO depth, in 8-byte groups
+    localparam integer OPW  = 3;    // pointer width; OGRP == 2**OPW
+    (* ram_style = "distributed" *) logic [63:0] ofifo [0:OGRP-1];
+    logic [OPW-1:0] wptr, rptr;     // circular write / read pointers
+    logic [3:0]     ofill;          // group entries in the FIFO, 0..OGRP
+    logic [63:0]    o_stage;        // byte accumulator for the group being built
+    logic [3:0]     o_cnt;          // bytes in o_stage, 0..8
+    logic           o_tail_done;    // the final partial group has been pushed
+    logic [31:0]    groups_taken;   // groups software popped (lost-group instrument)
 
     // Room for the decoder's next byte, counting the one already in flight.
     // The decoder decides to emit at cycle N when out_ready is high, but
@@ -173,15 +212,28 @@ module lz4_mmio #(
     // DROPPED silently, once per time the staging saturates, and the stream is
     // short by that many bytes with no error flagged.  Measured on the real
     // kernel prefix: 7 drops over 12 008 output bytes.  The in-flight byte must
-    // be counted here.
+    // be counted here.  With the FIFO, the accumulator is only a staging area
+    // that empties itself into the FIFO, so this exact test still holds and the
+    // extra buffering is the FIFO's, not the accumulator's.
     wire out_ready = ((o_cnt + {3'd0, out_valid}) < 4'd8);
 
     // Staging is non-empty exactly when a byte is presented to the decoder.
     wire in_valid = (i_cnt != 3'd0);
-
-    // The decoder takes the staged byte at position 0 exactly when it says it
-    // is ready.
     wire dec_takes = in_valid && in_ready;
+
+    wire fifo_full = (ofill == OGRP[3:0]);
+    // The accumulator is full: freeze it into the FIFO and start a new group.
+    wire push_full = (o_cnt == 4'd8) && !fifo_full;
+    // The decoder is done and a partial group is still staged: freeze that too.
+    wire push_tail = done_q && !o_tail_done && (o_cnt != 4'd0) && (o_cnt < 4'd8)
+                     && !fifo_full;
+    wire push      = push_full || push_tail;
+
+    wire busy = started & ~done_q & ~error_q;
+    // 0x1C status word: the group count in the low 16 bits, then the two
+    // input-side flags that used to live at 0x14 (which now carries
+    // groups_taken): [5] last_taken, [4] started, [3:0] groups ready.
+    wire [31:0] stat_word = {26'd0, last_taken, started, ofill};
 
     lz4_decoder u_dec (
         .clk        (clk),
@@ -206,7 +258,8 @@ module lz4_mmio #(
         if (!rst_n) begin
             i_stage <= 32'd0; i_cnt <= 3'd0; i_len <= 32'd0;
             o_stage <= 64'd0; o_cnt <= 4'd0;
-            snap <= 64'd0; snap_n <= 4'd0; snap_v <= 1'b0;
+            wptr <= '0; rptr <= '0; ofill <= 4'd0;
+            o_tail_done <= 1'b0; groups_taken <= 32'd0;
             done_q <= 1'b0; error_q <= 1'b0; started <= 1'b0;
             in_count <= 32'd0; out_count <= 32'd0;
             take_count <= 32'd0; last_taken <= 1'b0;
@@ -218,43 +271,51 @@ module lz4_mmio #(
                 last_taken <= in_last_q;      // sticky: did the end flag ever land
             end
 
+            // Accumulate the decoder's output byte into the 8-byte group.
             if (out_valid && (o_cnt < 4'd8)) begin
                 o_stage   <= o_stage | (({56'd0, out_data}) << ({o_cnt, 3'b000}));
                 o_cnt     <= o_cnt + 4'd1;
                 out_count <= out_count + 32'd1;
             end
-            // Explicit consume: software has taken the staged word.  Only a
-            // write does this - never a read.
-            // Consume exactly what software read, not everything.  Software reads
-            // the count, then the data, then consumes - and the decoder can stage
-            // more bytes in between.  Clearing everything dropped those, which is
-            // the 5% shortfall the loader reported (10 540 334 bytes against
-            // 11 097 600).  The write carries the count; the remainder shifts down
-            // so the bytes that arrived keep their order.
-            // Freeze the group when software asks for its size, so the data it
-            // then reads is the data it counted.
-            if (rd_cnt) begin
-                snap   <= o_stage;
-                snap_n <= o_cnt;
-                snap_v <= 1'b1;
+
+            // Freeze a group into the FIFO.  Bytes above o_cnt are zero padding
+            // (they are never set) so a partial final group reads back as its
+            // valid bytes followed by zeros.
+            if (push) begin
+                ofifo[wptr] <= o_stage;
+                wptr        <= wptr + 1'b1;
+                o_stage     <= 64'd0;
+                o_cnt       <= 4'd0;
+                if (push_tail) o_tail_done <= 1'b1;
             end
-            // Consume exactly the bytes the snapshot held.  Anything the decoder
-            // staged since stays, shifted down, and is read on the next take.
-            if (wr_hit && wr_reg == 4'd0 && s_wdata[1]) begin
-                o_cnt   <= (o_cnt >= snap_n) ? (o_cnt - snap_n) : 4'd0;
-                o_stage <= o_stage >> ({snap_n, 3'b000});
-                snap_v  <= 1'b0;
+
+            // Pop the head group when software reads the high half (0x08).  The
+            // low half (0x18) never pops; only a completed pair commits.
+            if (pop_req && (ofill != 4'd0)) begin
+                rptr         <= rptr + 1'b1;
+                groups_taken <= groups_taken + 32'd1;
             end
+            // One occupancy update so a push and a pop in the same cycle do not
+            // race: +1 for a freeze, -1 for a committed read.
+            ofill <= ofill + (push ? 4'd1 : 4'd0)
+                           - ((pop_req && (ofill != 4'd0)) ? 4'd1 : 4'd0);
+
             if (dec_done)  done_q  <= 1'b1;
             if (dec_error) error_q <= 1'b1;
 
             if (wr_hit) begin
                 case (wr_reg)
                 4'd0: if (s_wdata[0]) begin
-                    started    <= 1'b1;
-                    done_q     <= 1'b0;
-                    error_q    <= 1'b0;
-                    o_cnt      <= 4'd0;
+                    started     <= 1'b1;
+                    done_q      <= 1'b0;
+                    error_q     <= 1'b0;
+                    o_stage     <= 64'd0;
+                    o_cnt       <= 4'd0;
+                    wptr        <= '0;
+                    rptr        <= '0;
+                    ofill       <= 4'd0;
+                    o_tail_done <= 1'b0;
+                    groups_taken <= 32'd0;
                     i_stage    <= 32'd0;
                     i_cnt      <= 3'd0;
                     i_len      <= 32'd0;
@@ -275,17 +336,6 @@ module lz4_mmio #(
                 default: ;
                 endcase
             end
-
-            // Clear on the OUT read ITSELF, using the current address.  rd_reg is
-            // loaded at the end of the AR handshake, so testing it here looked one
-            // access into the past: out_avail was only released on the access AFTER
-            // the OUT read, and the CTRL read in between still reported bit3=1 for a
-            // byte already consumed.  Software following the documented pattern
-            // (read CTRL, if bit3 read OUT) then read OUT a second time and got the
-            // same out_reg back -- one duplicated byte per starvation episode, which
-            // is exactly the 13 190 715 produced against 11 097 600 expected.
-            // (no read side effect any more: the staged data is only consumed
-            // by the explicit write above.)
         end
     end
 
@@ -328,6 +378,8 @@ module lz4_mmio #(
     // ------------------------------------------------------------------
     logic [3:0]  rd_reg;
     wire         rd_hit = s_arready && s_arvalid;
+    // Reading the high half (0x08) commits / pops the head group.
+    wire         pop_req = rd_hit && (s_araddr[5:2] == 4'd2);
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -340,14 +392,6 @@ module lz4_mmio #(
                 s_rid     <= s_arid;
                 s_rlast   <= 1'b1;
                 rd_reg    <= s_araddr[5:2];
-                case (s_araddr[5:2])
-                // bit4 = "the input staging is empty, a four-byte write will be
-                // kept".  With four bytes staged, this is the only condition
-                // that matters: a write while staging is non-empty would drop
-                // whatever the decoder has not yet consumed.  It deliberately no
-                // longer asks whether the decoder is ready right now - writing
-                // while it is busy inside a match is harmless, the staged bytes
-                // simply wait - which is what removes one poll in four.
                 // Every 32-bit value is REPLICATED into both halves of the 64-bit
                 // read word.  The interconnect places the value in the lane the
                 // address selects, so a register at an odd 32-bit offset used to
@@ -356,26 +400,47 @@ module lz4_mmio #(
                 // staging stayed full and the decoder refused input forever.
                 // Replication is the standard way to serve a narrow register on a
                 // wide bus, and it makes every offset work.
-                4'd0: s_rdata <= {2{{27'd0, (i_cnt == 3'd0), (o_cnt != 4'd0),
+                case (s_araddr[5:2])
+                // bit4 = "the input staging is empty, a four-byte write will be
+                // kept".  With four bytes staged, this is the only condition
+                // that matters: a write while staging is non-empty would drop
+                // whatever the decoder has not yet consumed.  It deliberately no
+                // longer asks whether the decoder is ready right now - writing
+                // while it is busy inside a match is harmless, the staged bytes
+                // simply wait - which is what removes one poll in four.
+                // bit3 now means "a whole output group is available to read".
+                4'd0: s_rdata <= {2{{27'd0, (i_cnt == 3'd0), (ofill != 4'd0),
                                      done_q, error_q, busy}}};
-                4'd6: s_rdata <= {2{(snap_v ? snap[31:0] : o_stage[31:0])}};  // low half, frozen group
-                4'd7: s_rdata <= {2{{28'd0, o_cnt}}};  // size, and this read freezes the group
-                // The staged word is read as two 32-bit halves, not one 64-bit
-                // load: a 64-bit MMIO load never completes on this interconnect
-                // (no RVALID, core waits forever).  The high half lives at 0x08,
-                // the old byte register, which is free now that reading no longer
-                // consumes - deliberately NOT at 0x20: everything this peripheral
-                // has ever decoded sits between 0x00 and 0x1C, and an address the
-                // interconnect does not route answers nothing, which hangs the
-                // core exactly the same way.  Stay inside the proven window.
-                4'd2: s_rdata <= {2{(snap_v ? snap[63:32] : o_stage[63:32])}}; // high half, frozen group
-                4'd3: s_rdata <= {2{out_count}};          // bytes produced
-                // 0x10: what the decoder consumed, and whether it ever saw the
-                // end-of-block flag.  A short take_count means the wrapper lost
-                // input; a full one with the flag clear means the end was never
-                // signalled to the decoder.
+                // 0x0C: bytes the decoder produced.
+                4'd3: s_rdata <= {2{out_count}};
+                // 0x10: what the decoder consumed from the input staging, and
+                // (in 0x1C) whether it ever saw the end-of-block flag.  A short
+                // take_count means the wrapper lost input; a full one with the
+                // flag clear means the end was never signalled to the decoder.
                 4'd4: s_rdata <= {2{take_count}};
-                4'd5: s_rdata <= {2{{30'd0, last_taken, started}}};
+                // 0x14 read: groups software has consumed.  Together with
+                // out_count this makes a lost group detectable - the instrument
+                // the auto-increment trade has to keep.
+                4'd5: s_rdata <= {2{groups_taken}};
+                // 0x18: low half of the head group.  IDEMPOTENT - reading it does
+                // not advance the FIFO, so a retried low read is harmless.
+                4'd6: s_rdata <= {2{ofifo[rptr][31:0]}};
+                // 0x1C: [3:0] whole groups ready, [4] started, [5] last_taken.
+                // Read-only and side-effect free (the old read froze the group;
+                // this one has nothing to freeze).
+                4'd7: s_rdata <= {2{stat_word}};
+                // 0x08: high half of the head group.  This read COMPLETES the
+                // pair and pops (commits) the group - the auto-increment.  It is
+                // NOT idempotent; a retry advances past the next group, which is
+                // the trade the factor-of-two buys.  The staged word is read as
+                // two 32-bit halves, never one 64-bit load: a 64-bit MMIO load
+                // never completes on this interconnect (no RVALID, core waits
+                // forever).  The high half lives at 0x08, the old byte register,
+                // which is free now that the drain is group-based - deliberately
+                // NOT at 0x20, because everything this peripheral has ever decoded
+                // sits between 0x00 and 0x1C and an address the interconnect does
+                // not route answers nothing, which hangs the core the same way.
+                4'd2: s_rdata <= {2{ofifo[rptr][63:32]}};
                 default: s_rdata <= '0;
                 endcase
             end
@@ -385,5 +450,4 @@ module lz4_mmio #(
             end
         end
     end
-
 endmodule
