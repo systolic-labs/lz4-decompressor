@@ -159,6 +159,11 @@ it exposed four bugs the easy vector could not:
 
 Each of those is commented in the source with its reason.
 
+**On silicon (KU5P).**  The kernel's `klen` is exact (`00a95600`), all 1 387 200
+output groups are drained with none lost or duplicated (`groupes` = produced/8),
+and the LZ4 stage is **5 587 ms against 7 060 ms** for the previous drain.  Raw
+console: `doc/report/lz4_out_fifo_autoincrement.console.txt`.
+
 ## Licence
 
 Apache-2.0.  See `LICENSE`.
