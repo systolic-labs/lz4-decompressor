@@ -16,7 +16,12 @@
 //  is why the output FIFO entries carry {strobe, data}.
 //
 //  The read FSM issues one AR at a time and parks until R; the write FSM issues
-//  AW then W then waits for B.  Fixed ID 0 - the spike has one master.
+//  AW then W then waits for B.  Fixed ID 0 - there is one master.
+//
+//  Every register has exactly ONE always block that drives it.  The start reset
+//  is repeated at the top of each of those blocks rather than living in one
+//  shared block: a shared block re-assigning registers owned elsewhere is
+//  legal to a simulator and rejected by Vivado as a multiple-driver net.
 // ============================================================================
 module lz4_axi #(
     parameter integer AXI_AW  = 64,
@@ -104,7 +109,6 @@ module lz4_axi #(
     logic [IPW:0]    iwcnt;
     logic [31:0]     rd_word;        // next word index to fetch
     logic            rd_state;       // 0 = idle, 1 = waiting for R
-    logic            rd_busy;
 
     assign m_arid    = '0;
     assign m_arlen   = 8'd0;
@@ -115,12 +119,11 @@ module lz4_axi #(
                        && (iwcnt < IFW[IPW:0]);
     assign m_rready  = 1'b1;
 
-    wire iw_full = (iwcnt >= IFW[IPW:0]);
-
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            rd_state <= 1'b0; rd_busy <= 1'b0; rd_word <= 32'd0;
-            iwwp <= '0; iwrp <= '0; iwcnt <= '0;
+            rd_state <= 1'b0; rd_word <= 32'd0; iwwp <= '0; iwcnt <= '0;
+        end else if (start) begin
+            rd_state <= 1'b0; rd_word <= 32'd0; iwwp <= '0; iwcnt <= '0;
         end else begin
             case (rd_state)
             1'b0: if (m_arvalid && m_arready) begin
@@ -155,13 +158,15 @@ module lz4_axi #(
     wire  in_ready;
     wire  dec_takes = in_valid && in_ready;
     // Need the next word when ish is empty, or in the same cycle the last byte
-    // of the current word is consumed - that overlap is what removes the bubble
-    // between words.
+    // of the current word is consumed - that overlap removes the bubble between
+    // words.
     wire  need_word = (iw_rem == 4'd0) || (dec_takes && feed_last);
     wire  feed_load = need_word && iw_avail;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
+            ish <= 64'd0; iw_rem <= 4'd0; ip_taken <= 32'd0; iwrp <= '0;
+        end else if (start) begin
             ish <= 64'd0; iw_rem <= 4'd0; ip_taken <= 32'd0; iwrp <= '0;
         end else if (busy) begin
             if (dec_takes) ip_taken <= ip_taken + 32'd1;
@@ -197,25 +202,26 @@ module lz4_axi #(
     // Output: pack bytes into words -> word FIFO -> AXI write FSM
     // ------------------------------------------------------------------
     logic [71:0]     owmem [0:OFW-1];   // {strobe[7:0], data[63:0]}
-    logic [OPW-1:0]  owwp, owrp;
+    logic [OPW-1:0]  owwp;
     logic [OPW:0]    owcnt;
     logic [63:0]     osh;
     logic [3:0]      onb;               // bytes packed in osh, 0..7
     logic            flushed;
-    logic [31:0]     ow_word;           // write word index
 
     wire ow_full = (owcnt >= OFW[OPW:0]);
     // Accept a byte if it lands mid-word, or if completing a word there is a
     // slot for it.  The +out_valid counts the byte already in flight.
     assign out_ready = (((onb + {3'b0, out_valid}) < 4'd7) || !ow_full);
 
-    wire pack_push = (out_valid && out_ready && (onb == 4'd7));
     wire flush_req = dec_done && (onb != 4'd0) && !flushed && (owcnt < OFW[OPW:0]);
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            osh <= 64'd0; onb <= 4'd0; owwp <= '0; owrp <= '0; owcnt <= '0;
-            ow_word <= 32'd0; out_count <= 32'd0; flushed <= 1'b0;
+            osh <= 64'd0; onb <= 4'd0; owwp <= '0; owcnt <= '0;
+            out_count <= 32'd0; flushed <= 1'b0;
+        end else if (start) begin
+            osh <= 64'd0; onb <= 4'd0; owwp <= '0; owcnt <= '0;
+            out_count <= 32'd0; flushed <= 1'b0;
         end else if (busy) begin
             if (out_valid && out_ready) begin
                 out_count <= out_count + 32'd1;
@@ -238,15 +244,17 @@ module lz4_axi #(
                 onb     <= 4'd0;
                 flushed <= 1'b1;
             end
-            // write FSM pops one word
+            // the write FSM popped one word
             if (wr_pop) owcnt <= owcnt - 1'b1;
         end
     end
 
     // ---- write FSM: AW -> W -> B, one word at a time ----
-    logic [1:0] wst;
+    logic [1:0]  wst;
     logic [63:0] wsh;
     logic [7:0]  wstrb_q;
+    logic [OPW-1:0] owrp;
+    logic [31:0] ow_word;               // write word index
     localparam [1:0] W_IDLE = 2'd0, W_AW = 2'd1, W_W = 2'd2, W_B = 2'd3;
 
     assign m_awid    = '0;
@@ -266,6 +274,10 @@ module lz4_axi #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             wst <= W_IDLE; wsh <= 64'd0; wstrb_q <= 8'hFF;
+            ow_word <= 32'd0; owrp <= '0;
+        end else if (start) begin
+            wst <= W_IDLE; wsh <= 64'd0; wstrb_q <= 8'hFF;
+            ow_word <= 32'd0; owrp <= '0;
         end else begin
             case (wst)
             W_IDLE: if (owcnt != 0) begin
@@ -298,11 +310,7 @@ module lz4_axi #(
             if (dec_error) error_q <= 1'b1;
             if (all_done)  done_q  <= 1'b1;
             if (start) begin
-                started <= 1'b1; done_q <= 1'b0; error_q <= 1'b0; flushed <= 1'b0;
-                rd_word <= 32'd0; ow_word <= 32'd0; ip_taken <= 32'd0;
-                iwcnt <= '0; iwwp <= '0; iwrp <= '0;
-                owcnt <= '0; owwp <= '0; owrp <= '0;
-                ish <= 64'd0; iw_rem <= 4'd0; osh <= 64'd0; onb <= 4'd0;
+                started <= 1'b1; done_q <= 1'b0; error_q <= 1'b0;
             end
         end
     end
