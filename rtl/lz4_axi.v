@@ -266,20 +266,23 @@ module lz4_axi #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             wst <= W_IDLE; wsh <= 64'd0; wstrb_q <= 8'hFF;
-        end else case (wst)
-        W_IDLE: if (owcnt != 0) begin
-                    wsh     <= owmem[owrp][63:0];
-                    wstrb_q <= owmem[owrp][71:64];
-                    wst     <= W_AW;
-                end
-        W_AW:  if (m_awready) wst <= W_W;
-        W_W:   if (m_wready)  wst <= W_B;
-        W_B:   if (m_bvalid) begin
-                    wst     <= W_IDLE;
-                    ow_word <= ow_word + 32'd1;
-                end
-        endcase
-        if (wr_pop) owrp <= owrp + 1'b1;
+        end else begin
+            case (wst)
+            W_IDLE: if (owcnt != 0) begin
+                        wsh     <= owmem[owrp][63:0];
+                        wstrb_q <= owmem[owrp][71:64];
+                        wst     <= W_AW;
+                    end
+            W_AW:  if (m_awready) wst <= W_W;
+            W_W:   if (m_wready)  wst <= W_B;
+            W_B:   if (m_bvalid) begin
+                        wst     <= W_IDLE;
+                        ow_word <= ow_word + 32'd1;
+                    end
+            default: wst <= W_IDLE;
+            endcase
+            if (wr_pop) owrp <= owrp + 1'b1;
+        end
     end
 
     // ------------------------------------------------------------------
