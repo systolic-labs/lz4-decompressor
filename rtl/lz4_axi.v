@@ -1,42 +1,41 @@
 // ============================================================================
 //  lz4_axi.v - LZ4 decoder behind an AXI4 master stream engine
 // ----------------------------------------------------------------------------
-//  Step 4/5 of doc/lz4_dma_engine.md.  The compressed source is fetched as
-//  64-bit words from memory and the decompressed output is packed into 64-bit
-//  words and written back.  The CPU only programmes src/dst/len and watches
-//  done - three accesses per block instead of ~3.6 M.
+//  The compressed source is fetched from memory and the decompressed output is
+//  packed into 64-bit words and written back.  The CPU programmes src/dst/len
+//  and watches done.
 //
-//  READ vs WRITE.  This master interleaves single-beat reads and writes, which
-//  the DMA never does (it moves bursts one direction at a time).  On silicon
-//  that pattern produced a *non-deterministic* short output - two boots of the
-//  same kernel gave 00a94aba and 00a94489 instead of 00a95600, with no error -
-//  so the read phase and the write phase are now mutually excluded: a read
-//  command is not issued while a write transaction is in flight, and a write is
-//  not started while a read transaction is in flight.  That costs little (the
-//  input is 25 % of the traffic) and removes the overlap the DDR4 bridge was
-//  never exercised with.
+//  WHY BURSTS.  Single-beat reads sustained back-to-back gave a
+//  non-deterministic short output on silicon (klen 00a94aba / 00a94489 /
+//  00a41542 against 00a95600) while the engine's own counters were exact
+//  (read words == ceil(len/8), fed == len, err == 0): the data was wrong, not
+//  the bookkeeping.  The only other reader on this crossbar, the CPU, reads
+//  slowly and byte-wise; the only other *bulk* reader, the DMA, moves bursts.
+//  So the read is now issued as a burst of up to RBURST beats - the DMA's
+//  proven pattern - instead of a stream of single beats.
 //
-//  DEBUG COUNTERS.  dbg_rd / dbg_wr count accepted read words and completed
-//  writes, dbg_feed is the bytes handed to the decoder, dbg_err counts non-OKAY
-//  responses.  They localise a shortfall to the read, the feed or the write
-//  side without another guess.
+//  READ vs WRITE.  A read transaction is still not started while a write
+//  transaction is in flight, and vice versa (the engine used to interleave
+//  them, which nothing else on this bridge does).
 //
-//  Every register has exactly ONE always block that drives it: the start reset
-//  is repeated at the top of each of those blocks, because a shared block
-//  re-assigning registers owned elsewhere is legal to a simulator and rejected
-//  by Vivado as a multiple-driver net.
+//  CHECKS.  dbg_sum XORs every source word the engine reads; the loader
+//  computes the same XOR over the source with the CPU and compares.  If the
+//  two differ, the read path is corrupting data; if they agree, the fault is
+//  further in.
+//
+//  Every register has exactly ONE always block that drives it.
 // ============================================================================
 module lz4_axi #(
     parameter integer AXI_AW  = 64,
     parameter integer AXI_DW  = 64,
     parameter integer AXI_IDW = 4,
-    parameter integer IFW     = 16,   // input word FIFO depth, 64-bit words
-    parameter integer OFW     = 16    // output word FIFO depth
+    parameter integer IFW     = 32,   // input word FIFO depth, 64-bit words
+    parameter integer OFW     = 16,   // output word FIFO depth
+    parameter integer RBURST  = 8     // beats per read burst
 ) (
     input  logic          clk,
     input  logic          rst_n,
 
-    // control (MMIO registers in the SoC)
     input  logic          start,
     input  logic [63:0]   src_addr,
     input  logic [63:0]   dst_addr,
@@ -46,11 +45,12 @@ module lz4_axi #(
     output logic          error,
     output logic [31:0]   out_count,
 
-    // debug counters (readable through the register file)
+    // debug: counters and the source XOR
     output logic [31:0]   dbg_rd,
     output logic [31:0]   dbg_wr,
     output logic [31:0]   dbg_feed,
     output logic [31:0]   dbg_err,
+    output logic [63:0]   dbg_sum,
 
     // AXI4 master
     output logic [AXI_IDW-1:0]  m_arid,
@@ -88,7 +88,7 @@ module lz4_axi #(
     localparam integer OPW = $clog2(OFW);
 
     // ------------------------------------------------------------------
-    // History window (decoder contract: registered read).
+    // History window
     // ------------------------------------------------------------------
     (* ram_style = "block" *) logic [7:0] win [0:65535];
     logic [15:0] win_waddr, win_raddr;
@@ -110,68 +110,71 @@ module lz4_axi #(
 
     wire [31:0] in_words = (ilen + 32'd7) >> 3;
 
-    // The write FSM state is declared here because the read FSM's arvalid
-    // depends on whether a WRITE transaction is in flight (see the header).
+    // write FSM state, declared early: the read FSM's arvalid depends on it
     localparam [1:0] W_IDLE = 2'd0, W_AW = 2'd1, W_W = 2'd2, W_B = 2'd3;
     logic [1:0] wst;
     wire  wr_inflight = (wst != W_IDLE);
 
-    // Non-OKAY response flags, kept combinational so a single always block can
-    // own dbg_err (two blocks incrementing it would be a multiple-driver net).
     wire rd_err = (rd_state == 1'b1) && m_rvalid && (m_rresp != 2'b00);
     wire wr_err = wr_pop && (m_bresp != 2'b00);
 
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)   dbg_err <= 32'd0;
+        if (!rst_n)     dbg_err <= 32'd0;
         else if (start) dbg_err <= 32'd0;
         else            dbg_err <= dbg_err + (rd_err ? 32'd1 : 32'd0)
                                           + (wr_err ? 32'd1 : 32'd0);
     end
 
     // ------------------------------------------------------------------
-    // Input: AXI read FSM -> word FIFO -> byte feed to the decoder
+    // Input: AXI read bursts -> word FIFO -> byte feed to the decoder
     // ------------------------------------------------------------------
     logic [63:0]     iwmem [0:IFW-1];
     logic [IPW-1:0]  iwwp, iwrp;
     logic [IPW:0]    iwcnt;
     logic [31:0]     rd_word;        // next word index to fetch
-    logic            rd_state;       // 0 = idle, 1 = waiting for R
+    logic            rd_state;       // 0 = idle, 1 = receiving a burst
+    logic [7:0]      rd_beats;       // beats left in the current burst
 
     wire rd_inflight = (rd_state == 1'b1);
 
+    // burst length this cycle: RBURST beats, less at the end of the block
+    wire [31:0] words_left = in_words - rd_word;
+    wire [31:0] burst_w    = (words_left >= RBURST[31:0]) ? RBURST[31:0] : words_left;
+    wire        can_burst  = (rd_state == 1'b0) && busy && (words_left != 0)
+                             && (({1'b0, iwcnt} + burst_w[IPW:0]) <= IFW[IPW:0])
+                             && !wr_inflight;
+
     assign m_arid    = '0;
-    assign m_arlen   = 8'd0;
-    assign m_arsize  = 3'd3;         // 8 bytes
-    assign m_arburst = 2'd1;         // INCR
+    assign m_arlen   = burst_w[7:0] - 8'd1;      // beats - 1
+    assign m_arsize  = 3'd3;                     // 8 bytes
+    assign m_arburst = 2'd1;                     // INCR
     assign m_araddr  = src_addr + {rd_word, 3'b000};
-    // A read is not issued while a write transaction is in flight (see header).
-    assign m_arvalid = (rd_state == 1'b0) && busy && (rd_word < in_words)
-                       && (iwcnt < IFW[IPW:0]) && !wr_inflight;
+    assign m_arvalid = can_burst;
     assign m_rready  = 1'b1;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             rd_state <= 1'b0; rd_word <= 32'd0; iwwp <= '0; iwcnt <= '0;
-            dbg_rd <= 32'd0; dbg_err <= 32'd0;
+            rd_beats <= 8'd0; dbg_rd <= 32'd0; dbg_sum <= 64'd0;
         end else if (start) begin
             rd_state <= 1'b0; rd_word <= 32'd0; iwwp <= '0; iwcnt <= '0;
-            dbg_rd <= 32'd0; dbg_err <= 32'd0;
+            rd_beats <= 8'd0; dbg_rd <= 32'd0; dbg_sum <= 64'd0;
         end else begin
-            case (rd_state)
-            1'b0: if (m_arvalid && m_arready) begin
-                      rd_state <= 1'b1;
-                  end
-            1'b1: if (m_rvalid) begin
-                      iwmem[iwwp] <= m_rdata;
-                      iwwp        <= iwwp + 1'b1;
-                      rd_word     <= rd_word + 32'd1;
-                      rd_state    <= 1'b0;
-                  end
-            endcase
-            if (rd_state == 1'b1 && m_rvalid) dbg_rd <= dbg_rd + 32'd1;
-            // iwcnt counts words WAITING to be loaded (the word in ish is not
-            // counted).  One assignment: two separate ifs would drop a term
-            // whenever a fetch and a load land in the same cycle.
+            if (rd_state == 1'b0) begin
+                if (m_arvalid && m_arready) begin
+                    rd_state <= 1'b1;
+                    rd_beats <= burst_w[7:0];
+                end
+            end else if (m_rvalid) begin
+                iwmem[iwwp] <= m_rdata;
+                iwwp        <= iwwp + 1'b1;
+                rd_word     <= rd_word + 32'd1;
+                dbg_rd      <= dbg_rd + 32'd1;
+                dbg_sum     <= dbg_sum ^ m_rdata;
+                if (rd_beats == 8'd1) rd_state <= 1'b0;
+                else                  rd_beats <= rd_beats - 8'd1;
+            end
+            // iwcnt = words WAITING to be loaded, one assignment only
             iwcnt <= iwcnt + ((rd_state == 1'b1 && m_rvalid) ? 1'b1 : 1'b0)
                           - (feed_load ? 1'b1 : 1'b0);
         end
@@ -179,7 +182,7 @@ module lz4_axi #(
 
     // ---- byte feed: shift the head word out one byte at a time ----
     logic [63:0] ish;
-    logic [3:0]  iw_rem;             // valid bytes left in ish
+    logic [3:0]  iw_rem;
     logic [31:0] ip_taken;
     wire  iw_avail  = (iwcnt != 0);
     wire  feed_last = (iw_rem == 4'd1);
@@ -232,18 +235,36 @@ module lz4_axi #(
     // ------------------------------------------------------------------
     // Output: pack bytes into words -> word FIFO -> AXI write FSM
     // ------------------------------------------------------------------
-    logic [71:0]     owmem [0:OFW-1];   // {strobe[7:0], data[63:0]}
+    logic [71:0]     owmem [0:OFW-1];
     logic [OPW-1:0]  owwp;
     logic [OPW:0]    owcnt;
     logic [63:0]     osh;
-    logic [3:0]      onb;               // bytes packed in osh, 0..7
+    logic [3:0]      onb;
     logic            flushed;
+    logic [63:0]     wsh;
+    logic [7:0]      wstrb_q;
+    logic [OPW-1:0]  owrp;
+    logic [31:0]     ow_word;
 
     wire ow_full = (owcnt >= OFW[OPW:0]);
     assign out_ready = (((onb + {3'b0, out_valid}) < 4'd7) || !ow_full);
 
-    wire flush_req  = dec_done && (onb != 4'd0) && !flushed && (owcnt < OFW[OPW:0]);
-    wire pack_done  = out_valid && out_ready && (onb == 4'd7);
+    wire flush_req = dec_done && (onb != 4'd0) && !flushed && (owcnt < OFW[OPW:0]);
+    wire pack_done = out_valid && out_ready && (onb == 4'd7);
+
+    assign m_awid    = '0;
+    assign m_awlen   = 8'd0;
+    assign m_awsize  = 3'd3;
+    assign m_awburst = 2'd1;
+    assign m_awaddr  = dst_addr + {ow_word, 3'b000};
+    assign m_awvalid = (wst == W_AW);
+    assign m_wdata   = wsh;
+    assign m_wstrb   = wstrb_q;
+    assign m_wlast   = 1'b1;
+    assign m_wvalid  = (wst == W_W);
+    assign m_bready  = 1'b1;
+
+    wire wr_pop = (wst == W_B) && m_bvalid;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -272,8 +293,6 @@ module lz4_axi #(
                 onb     <= 4'd0;
                 flushed <= 1'b1;
             end
-            // ONE occupancy update: a push and a pop in the same cycle must net
-            // to zero, not let the pop win (which would free the FIFO early).
             owcnt <= owcnt + (pack_done ? 1'b1 : 1'b0)
                           + (flush_req ? 1'b1 : 1'b0)
                           - (wr_pop    ? 1'b1 : 1'b0);
@@ -281,25 +300,6 @@ module lz4_axi #(
     end
 
     // ---- write FSM: AW -> W -> B, one word at a time ----
-    logic [63:0] wsh;
-    logic [7:0]  wstrb_q;
-    logic [OPW-1:0] owrp;
-    logic [31:0] ow_word;               // write word index
-
-    assign m_awid    = '0;
-    assign m_awlen   = 8'd0;
-    assign m_awsize  = 3'd3;
-    assign m_awburst = 2'd1;
-    assign m_awaddr  = dst_addr + {ow_word, 3'b000};
-    assign m_awvalid = (wst == W_AW);
-    assign m_wdata   = wsh;
-    assign m_wstrb   = wstrb_q;
-    assign m_wlast   = 1'b1;
-    assign m_wvalid  = (wst == W_W);
-    assign m_bready  = 1'b1;
-
-    wire wr_pop = (wst == W_B) && m_bvalid;
-
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             wst <= W_IDLE; wsh <= 64'd0; wstrb_q <= 8'hFF;
@@ -309,8 +309,10 @@ module lz4_axi #(
             ow_word <= 32'd0; owrp <= '0; dbg_wr <= 32'd0;
         end else begin
             case (wst)
-            // A write is not started while a read transaction is in flight.
-            W_IDLE: if ((owcnt != 0) && !rd_inflight) begin
+            // no write starts while a read transaction is in flight, nor in the
+            // same cycle a read address handshake is taking place
+            W_IDLE: if ((owcnt != 0) && !rd_inflight
+                        && !(m_arvalid && m_arready)) begin
                         wsh     <= owmem[owrp][63:0];
                         wstrb_q <= owmem[owrp][71:64];
                         wst     <= W_AW;
@@ -324,14 +326,14 @@ module lz4_axi #(
             default: wst <= W_IDLE;
             endcase
             if (wr_pop) begin
-                owrp <= owrp + 1'b1;
+                owrp   <= owrp + 1'b1;
                 dbg_wr <= dbg_wr + 32'd1;
             end
         end
     end
 
     // ------------------------------------------------------------------
-    // Completion: decoder done, packer empty, FIFO empty, write FSM idle.
+    // Completion
     // ------------------------------------------------------------------
     wire all_done = dec_done && (onb == 4'd0) && (owcnt == 0)
                     && (wst == W_IDLE) && !flush_req;

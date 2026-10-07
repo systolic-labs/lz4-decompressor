@@ -106,12 +106,16 @@ module lz4_engine #(
     logic        busy, done, error;
     logic [31:0] out_count;
     logic [31:0] dbg_rd, dbg_wr, dbg_feed, dbg_err;
-    logic [1:0]  dbg_sel;
+    logic [63:0] dbg_sum;
+    logic [2:0]  dbg_sel;
 
-    // 0x1C selects which debug counter a read returns.
+    // 0x1C selects which debug value a read returns: 0 read words, 1 written
+    // words, 2 bytes fed, 3 non-OKAY responses, 4/5 the source XOR lo/hi.
     wire [31:0] dbg_val = (dbg_sel == 2'd0) ? dbg_rd   :
                           (dbg_sel == 2'd1) ? dbg_wr   :
-                          (dbg_sel == 2'd2) ? dbg_feed : dbg_err;
+                          (dbg_sel == 2'd2) ? dbg_feed :
+                          (dbg_sel == 2'd3) ? dbg_err  :
+                          (dbg_sel == 2'd4) ? dbg_sum[31:0] : dbg_sum[63:32];
 
     lz4_axi #(
         .AXI_AW (AXI_AW), .AXI_DW (AXI_DW), .AXI_IDW (AXI_IDW)
@@ -120,6 +124,7 @@ module lz4_engine #(
         .start(start_q), .src_addr(src_q), .dst_addr(dst_q), .ilen(len_q),
         .busy(busy), .done(done), .error(error), .out_count(out_count),
         .dbg_rd(dbg_rd), .dbg_wr(dbg_wr), .dbg_feed(dbg_feed), .dbg_err(dbg_err),
+        .dbg_sum(dbg_sum),
         .m_arid(m_arid), .m_araddr(m_araddr), .m_arlen(m_arlen), .m_arsize(m_arsize),
         .m_arburst(m_arburst), .m_arvalid(m_arvalid), .m_arready(m_arready),
         .m_rid(m_rid), .m_rdata(m_rdata), .m_rresp(m_rresp), .m_rlast(m_rlast),
@@ -174,7 +179,7 @@ module lz4_engine #(
             4'd3: dst_q[31:0]  <= s_wdata[31:0];
             4'd4: dst_q[63:32] <= s_wdata[31:0];
             4'd5: len_q        <= s_wdata[31:0];
-            4'd7: dbg_sel      <= s_wdata[1:0];
+            4'd7: dbg_sel      <= s_wdata[2:0];
             default: ;
             endcase
         end

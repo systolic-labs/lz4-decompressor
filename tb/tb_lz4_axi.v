@@ -51,26 +51,28 @@ module tb_lz4_axi;
     reg [63:0] mem [0:(1<<MW)-1];
 
     reg         rd_busy;
-    reg [63:0]  rd_data;
-    reg         wr_busy;
+    reg [63:0]  rd_addr_q;
     reg [63:0]  wr_addr_q;
+    reg [7:0]   rd_cnt;
     integer     b;
 
     assign m_arready = ~rd_busy;
     assign m_rvalid  = rd_busy;
-    assign m_rdata   = rd_data;
-    assign m_rlast   = 1'b1;
+    assign m_rdata   = mem[rd_addr_q[MW+2:3]];
+    assign m_rlast   = (rd_cnt == 8'd1);
     assign m_rresp   = 2'b00;
     assign m_rid     = 4'd0;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            rd_busy <= 1'b0; rd_data <= 64'd0;
+            rd_busy <= 1'b0; rd_addr_q <= 64'd0; rd_cnt <= 8'd0;
         end else if (!rd_busy && m_arvalid && m_arready) begin
-            rd_data <= mem[m_araddr[MW+2:3]];
-            rd_busy <= 1'b1;
+            rd_addr_q <= m_araddr;
+            rd_cnt    <= m_arlen + 8'd1;
+            rd_busy   <= 1'b1;
         end else if (rd_busy && m_rready) begin
-            rd_busy <= 1'b0;
+            if (rd_cnt == 8'd1) rd_busy <= 1'b0;
+            else begin rd_cnt <= rd_cnt - 8'd1; rd_addr_q <= rd_addr_q + 64'd8; end
         end
     end
 
