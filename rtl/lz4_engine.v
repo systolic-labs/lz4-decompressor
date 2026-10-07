@@ -105,6 +105,13 @@ module lz4_engine #(
     logic        start_q;
     logic        busy, done, error;
     logic [31:0] out_count;
+    logic [31:0] dbg_rd, dbg_wr, dbg_feed, dbg_err;
+    logic [1:0]  dbg_sel;
+
+    // 0x1C selects which debug counter a read returns.
+    wire [31:0] dbg_val = (dbg_sel == 2'd0) ? dbg_rd   :
+                          (dbg_sel == 2'd1) ? dbg_wr   :
+                          (dbg_sel == 2'd2) ? dbg_feed : dbg_err;
 
     lz4_axi #(
         .AXI_AW (AXI_AW), .AXI_DW (AXI_DW), .AXI_IDW (AXI_IDW)
@@ -112,6 +119,7 @@ module lz4_engine #(
         .clk(clk), .rst_n(rst_n),
         .start(start_q), .src_addr(src_q), .dst_addr(dst_q), .ilen(len_q),
         .busy(busy), .done(done), .error(error), .out_count(out_count),
+        .dbg_rd(dbg_rd), .dbg_wr(dbg_wr), .dbg_feed(dbg_feed), .dbg_err(dbg_err),
         .m_arid(m_arid), .m_araddr(m_araddr), .m_arlen(m_arlen), .m_arsize(m_arsize),
         .m_arburst(m_arburst), .m_arvalid(m_arvalid), .m_arready(m_arready),
         .m_rid(m_rid), .m_rdata(m_rdata), .m_rresp(m_rresp), .m_rlast(m_rlast),
@@ -156,6 +164,7 @@ module lz4_engine #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             src_q <= 64'd0; dst_q <= 64'd0; len_q <= 32'd0; start_q <= 1'b0;
+            dbg_sel <= 2'd0;
         end else begin
             start_q <= 1'b0;                       // self-clearing pulse
             if (wr_hit) case (wr_reg)
@@ -165,6 +174,7 @@ module lz4_engine #(
             4'd3: dst_q[31:0]  <= s_wdata[31:0];
             4'd4: dst_q[63:32] <= s_wdata[31:0];
             4'd5: len_q        <= s_wdata[31:0];
+            4'd7: dbg_sel      <= s_wdata[1:0];
             default: ;
             endcase
         end
@@ -193,6 +203,7 @@ module lz4_engine #(
                 4'd4: s_rdata <= {2{dst_q[63:32]}};
                 4'd5: s_rdata <= {2{len_q}};
                 4'd6: s_rdata <= {2{out_count}};
+                4'd7: s_rdata <= {2{dbg_val}};
                 default: s_rdata <= '0;
                 endcase
             end
