@@ -29,9 +29,8 @@ module lz4_axi #(
     parameter integer AXI_AW  = 64,
     parameter integer AXI_DW  = 64,
     parameter integer AXI_IDW = 4,
-    parameter integer IFW     = 32,   // input word FIFO depth, 64-bit words
-    parameter integer OFW     = 16,   // output word FIFO depth
-    parameter integer RBURST  = 8     // beats per read burst
+    parameter integer IFW     = 16,   // input word FIFO depth, 64-bit words
+    parameter integer OFW     = 16    // output word FIFO depth
 ) (
     input  logic          clk,
     input  logic          rst_n,
@@ -126,53 +125,46 @@ module lz4_axi #(
     end
 
     // ------------------------------------------------------------------
-    // Input: AXI read bursts -> word FIFO -> byte feed to the decoder
+    // Input: AXI read -> word FIFO -> byte feed.  SINGLE BEAT: a burst version
+    // was tried and hung on silicon after 4 words (the write side stalled and
+    // the read/write exclusion then blocked the reads), so the read is one
+    // 64-bit beat at a time.  dbg_sum XORs every word read, so the loader can
+    // compare the engine's view of the source with the CPU's.
     // ------------------------------------------------------------------
     logic [63:0]     iwmem [0:IFW-1];
     logic [IPW-1:0]  iwwp, iwrp;
     logic [IPW:0]    iwcnt;
     logic [31:0]     rd_word;        // next word index to fetch
-    logic            rd_state;       // 0 = idle, 1 = receiving a burst
-    logic [7:0]      rd_beats;       // beats left in the current burst
+    logic            rd_state;       // 0 = idle, 1 = waiting for R
 
     wire rd_inflight = (rd_state == 1'b1);
 
-    // burst length this cycle: RBURST beats, less at the end of the block
-    wire [31:0] words_left = in_words - rd_word;
-    wire [31:0] burst_w    = (words_left >= RBURST[31:0]) ? RBURST[31:0] : words_left;
-    wire        can_burst  = (rd_state == 1'b0) && busy && (words_left != 0)
-                             && (({1'b0, iwcnt} + burst_w[IPW:0]) <= IFW[IPW:0])
-                             && !wr_inflight;
-
     assign m_arid    = '0;
-    assign m_arlen   = burst_w[7:0] - 8'd1;      // beats - 1
+    assign m_arlen   = 8'd0;
     assign m_arsize  = 3'd3;                     // 8 bytes
     assign m_arburst = 2'd1;                     // INCR
     assign m_araddr  = src_addr + {rd_word, 3'b000};
-    assign m_arvalid = can_burst;
+    assign m_arvalid = (rd_state == 1'b0) && busy && (rd_word < in_words)
+                       && (iwcnt < IFW[IPW:0]) && !wr_inflight;
     assign m_rready  = 1'b1;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             rd_state <= 1'b0; rd_word <= 32'd0; iwwp <= '0; iwcnt <= '0;
-            rd_beats <= 8'd0; dbg_rd <= 32'd0; dbg_sum <= 64'd0;
+            dbg_rd <= 32'd0; dbg_sum <= 64'd0;
         end else if (start) begin
             rd_state <= 1'b0; rd_word <= 32'd0; iwwp <= '0; iwcnt <= '0;
-            rd_beats <= 8'd0; dbg_rd <= 32'd0; dbg_sum <= 64'd0;
+            dbg_rd <= 32'd0; dbg_sum <= 64'd0;
         end else begin
             if (rd_state == 1'b0) begin
-                if (m_arvalid && m_arready) begin
-                    rd_state <= 1'b1;
-                    rd_beats <= burst_w[7:0];
-                end
+                if (m_arvalid && m_arready) rd_state <= 1'b1;
             end else if (m_rvalid) begin
                 iwmem[iwwp] <= m_rdata;
                 iwwp        <= iwwp + 1'b1;
                 rd_word     <= rd_word + 32'd1;
                 dbg_rd      <= dbg_rd + 32'd1;
                 dbg_sum     <= dbg_sum ^ m_rdata;
-                if (rd_beats == 8'd1) rd_state <= 1'b0;
-                else                  rd_beats <= rd_beats - 8'd1;
+                rd_state    <= 1'b0;
             end
             // iwcnt = words WAITING to be loaded, one assignment only
             iwcnt <= iwcnt + ((rd_state == 1'b1 && m_rvalid) ? 1'b1 : 1'b0)
