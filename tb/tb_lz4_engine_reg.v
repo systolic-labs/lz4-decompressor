@@ -142,10 +142,13 @@ module tb_lz4_engine_reg;
     reg [7:0] input_bytes  [0:`IN_LEN-1];
     reg [7:0] expect_bytes [0:`EXP_LEN-1];
     integer k, errs, first_bad, cyc;
+    reg [31:0] out_bytes;
+    reg [63:0] ctrl_now;
     reg [1023:0] verdict;
 
     localparam [63:0] R_CTRL = 64'h00, R_SRCL = 64'h04, R_SRCH = 64'h08;
     localparam [63:0] R_DSTL = 64'h0C, R_DSTH = 64'h10, R_LEN = 64'h14, R_OUT = 64'h18;
+    localparam [63:0] R_DBG  = 64'h1C;
 
     initial begin
         $readmemh("in.hex", input_bytes);
@@ -181,16 +184,32 @@ module tb_lz4_engine_reg;
                 errs = errs + 1;
             end
         reg_read(R_OUT);
-        if (rdv[31:0] != `EXP_LEN) errs = errs + 1;
+        out_bytes = rdv[31:0];
+        reg_read(R_CTRL);
+        ctrl_now = rdv;
+        if (out_bytes != `EXP_LEN) errs = errs + 1;
+
+        // Debug path: source XOR as the CPU sees it vs the engine's dbg_sum,
+        // and check the 0x1C selector returns the two different halves.
+        begin
+            reg [63:0] csum; reg [31:0] lo, hi; integer wi;
+            csum = 64'd0;
+            for (wi = 0; wi < ((`IN_LEN + 7) / 8); wi = wi + 1)
+                csum = csum ^ mem[wi];
+            reg_write(R_DBG, 64'd4); reg_read(R_DBG); lo = rdv[31:0];
+            reg_write(R_DBG, 64'd5); reg_read(R_DBG); hi = rdv[31:0];
+            $display("  csum cpu=%h eng=%h", csum, {hi, lo});
+            if ({hi, lo} !== csum) begin errs = errs + 1; $display("  CSUM MISMATCH"); end
+        end
 
         verdict = "PASS";
-        if (rdv[2])                            verdict = "FAIL decoder-error";
-        if (rdv[31:0] != `EXP_LEN)             verdict = "FAIL wrong-length";
-        if (errs != 0)                         verdict = "FAIL wrong-bytes";
+        if (ctrl_now[2])             verdict = "FAIL decoder-error";
+        if (out_bytes != `EXP_LEN)   verdict = "FAIL wrong-length";
+        if (errs != 0)               verdict = "FAIL wrong-bytes";
 
         $display("--------------------------------------------------");
         $display("  input bytes    : %0d", `IN_LEN);
-        $display("  output bytes   : %0d of %0d expected", rdv[31:0], `EXP_LEN);
+        $display("  output bytes   : %0d of %0d expected", out_bytes, `EXP_LEN);
         $display("  cycles (incl regs): %0d", cyc);
         if (first_bad >= 0)
             $display("  first mismatch : byte %0d  got %02x  expected %02x",

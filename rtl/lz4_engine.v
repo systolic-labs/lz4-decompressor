@@ -111,11 +111,11 @@ module lz4_engine #(
 
     // 0x1C selects which debug value a read returns: 0 read words, 1 written
     // words, 2 bytes fed, 3 non-OKAY responses, 4/5 the source XOR lo/hi.
-    wire [31:0] dbg_val = (dbg_sel == 2'd0) ? dbg_rd   :
-                          (dbg_sel == 2'd1) ? dbg_wr   :
-                          (dbg_sel == 2'd2) ? dbg_feed :
-                          (dbg_sel == 2'd3) ? dbg_err  :
-                          (dbg_sel == 2'd4) ? dbg_sum[31:0] : dbg_sum[63:32];
+    wire [31:0] dbg_val = (dbg_sel == 3'd0) ? dbg_rd   :
+                          (dbg_sel == 3'd1) ? dbg_wr   :
+                          (dbg_sel == 3'd2) ? dbg_feed :
+                          (dbg_sel == 3'd3) ? dbg_err  :
+                          (dbg_sel == 3'd4) ? dbg_sum[31:0] : dbg_sum[63:32];
 
     lz4_axi #(
         .AXI_AW (AXI_AW), .AXI_DW (AXI_DW), .AXI_IDW (AXI_IDW)
