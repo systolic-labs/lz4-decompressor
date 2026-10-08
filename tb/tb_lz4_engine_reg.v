@@ -200,6 +200,18 @@ module tb_lz4_engine_reg;
             reg_write(R_DBG, 64'd5); reg_read(R_DBG); hi = rdv[31:0];
             $display("  csum cpu=%h eng=%h", csum, {hi, lo});
             if ({hi, lo} !== csum) begin errs = errs + 1; $display("  CSUM MISMATCH"); end
+            // order-sensitive hash of the bytes handed to the decoder
+            begin
+                reg [31:0] bh; reg [31:0] bi; reg [7:0] by;
+                bh = 32'd0;
+                for (bi = 0; bi < `IN_LEN; bi = bi + 1) begin
+                    by = mem[bi/8][8*(bi%8) +: 8];
+                    bh = ((bh << 1) | (bh >> 31)) ^ {24'd0, by};
+                end
+                reg_write(R_DBG, 64'd6); reg_read(R_DBG);
+                $display("  hash cpu=%h eng=%h", bh, rdv[31:0]);
+                if (rdv[31:0] !== bh) begin errs = errs + 1; $display("  HASH MISMATCH"); end
+            end
         end
 
         verdict = "PASS";

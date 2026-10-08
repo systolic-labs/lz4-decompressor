@@ -50,6 +50,7 @@ module lz4_axi #(
     output logic [31:0]   dbg_feed,
     output logic [31:0]   dbg_err,
     output logic [63:0]   dbg_sum,
+    output logic [31:0]   dbg_hash,
 
     // AXI4 master
     output logic [AXI_IDW-1:0]  m_arid,
@@ -192,10 +193,17 @@ module lz4_axi #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             ish <= 64'd0; iw_rem <= 4'd0; ip_taken <= 32'd0; iwrp <= '0;
+            dbg_hash <= 32'd0;
         end else if (start) begin
             ish <= 64'd0; iw_rem <= 4'd0; ip_taken <= 32'd0; iwrp <= '0;
+            dbg_hash <= 32'd0;
         end else if (busy) begin
             if (dec_takes) ip_taken <= ip_taken + 32'd1;
+            // Order-sensitive hash of the bytes HANDED TO THE DECODER: a plain
+            // XOR is order-independent, so it cannot see a reordered stream -
+            // this can.
+            if (dec_takes)
+                dbg_hash <= {dbg_hash[30:0], dbg_hash[31]} ^ {24'd0, in_data};
             if (feed_load) begin
                 ish    <= iwmem[iwrp];
                 iwrp   <= iwrp + 1'b1;
