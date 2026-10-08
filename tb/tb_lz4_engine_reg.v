@@ -91,9 +91,13 @@ module tb_lz4_engine_reg;
     assign m_bresp   = 2'b00;
     assign m_bid     = 4'd0;
 
+    reg [7:0]   bwait;                    // modelled B-response latency
+    localparam [7:0] BWAIT = 8'd24;       // slow write path: fills the word FIFO
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             aw_seen <= 0; w_seen <= 0; bvalid <= 0; wr_addr_q <= 64'd0;
+            bwait <= 8'd0;
         end else begin
             if (m_awvalid && m_awready) begin wr_addr_q <= m_awaddr; aw_seen <= 1'b1; end
             if (m_wvalid && m_wready) begin
@@ -101,8 +105,19 @@ module tb_lz4_engine_reg;
                     if (m_wstrb[b]) mem[wr_addr_q[MW+2:3]][8*b +: 8] <= m_wdata[8*b +: 8];
                 w_seen <= 1'b1;
             end
-            if (!bvalid && aw_seen && w_seen) begin aw_seen <= 0; w_seen <= 0; bvalid <= 1'b1; end
-            else if (bvalid && m_bready) bvalid <= 1'b0;
+            // BVALID once BOTH AW and W are accepted, after a modelled delay so
+            // the output word FIFO actually fills - the regime that exposed the
+            // packer dropping a byte when the drain was temporarily slow.
+            if (!bvalid) begin
+                if (bwait != 8'd0) begin
+                    if (bwait == 8'd1) begin bvalid <= 1'b1; bwait <= 8'd0; end
+                    else bwait <= bwait - 8'd1;
+                end else if (aw_seen && w_seen) begin
+                    aw_seen <= 1'b0; w_seen <= 1'b0; bwait <= BWAIT;
+                end
+            end else if (m_bready) begin
+                bvalid <= 1'b0;
+            end
         end
     end
 

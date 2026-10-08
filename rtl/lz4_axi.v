@@ -246,11 +246,19 @@ module lz4_axi #(
     logic [OPW-1:0]  owrp;
     logic [31:0]     ow_word;
 
-    wire ow_full = (owcnt >= OFW[OPW:0]);
-    assign out_ready = (((onb + {3'b0, out_valid}) < 4'd7) || !ow_full);
+    wire ow_room = (owcnt < OFW[OPW:0]);
+    // EXACTLY the MMIO wrapper's proven accumulator test.  The old condition
+    // (((onb + out_valid) < 7) || !ow_full) let the decoder emit a byte that
+    // completed a word while the word FIFO was full: at N the (<7) term was
+    // true, at N+1 out_ready fell and the byte - a ONE-CYCLE out_valid pulse -
+    // was dropped without a flag.  Whether that happens depends on how often the
+    // FIFO fills, which is why simulation (fast drain) was exact and silicon was
+    // not, and why the length varied with the fill pattern.
+    assign out_ready = ((onb + {3'b0, out_valid}) < 4'd8);
 
-    wire flush_req = dec_done && (onb != 4'd0) && !flushed && (owcnt < OFW[OPW:0]);
-    wire pack_done = out_valid && out_ready && (onb == 4'd7);
+    wire push_word = (onb == 4'd8) && ow_room;
+    wire flush_req = dec_done && (onb != 4'd0) && (onb != 4'd8)
+                     && !flushed && ow_room;
 
     assign m_awid    = '0;
     assign m_awlen   = 8'd0;
@@ -274,17 +282,18 @@ module lz4_axi #(
             osh <= 64'd0; onb <= 4'd0; owwp <= '0; owcnt <= '0;
             out_count <= 32'd0; flushed <= 1'b0;
         end else if (busy) begin
-            if (out_valid && out_ready) begin
+            // Store on accumulator room, NOT on out_ready: out_ready is the
+            // decoder's backpressure, computed to count the in-flight byte.
+            if (out_valid && (onb < 4'd8)) begin
+                osh <= osh | ({56'd0, out_data} << {onb[2:0], 3'b000});
+                onb <= onb + 4'd1;
                 out_count <= out_count + 32'd1;
-                if (onb == 4'd7) begin
-                    owmem[owwp] <= {8'hFF, osh | ({56'd0, out_data} << 56)};
-                    owwp   <= owwp + 1'b1;
-                    osh    <= 64'd0;
-                    onb    <= 4'd0;
-                end else begin
-                    osh <= osh | ({56'd0, out_data} << {onb, 3'b000});
-                    onb <= onb + 4'd1;
-                end
+            end
+            if (push_word) begin
+                owmem[owwp] <= {8'hFF, osh};
+                owwp        <= owwp + 1'b1;
+                osh         <= 64'd0;
+                onb         <= 4'd0;
             end
             if (flush_req) begin
                 owmem[owwp] <= {(8'hFF >> (8 - onb)), osh};
@@ -293,7 +302,7 @@ module lz4_axi #(
                 onb     <= 4'd0;
                 flushed <= 1'b1;
             end
-            owcnt <= owcnt + (pack_done ? 1'b1 : 1'b0)
+            owcnt <= owcnt + (push_word ? 1'b1 : 1'b0)
                           + (flush_req ? 1'b1 : 1'b0)
                           - (wr_pop    ? 1'b1 : 1'b0);
         end
