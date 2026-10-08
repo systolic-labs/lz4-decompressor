@@ -29,8 +29,8 @@ module lz4_axi #(
     parameter integer AXI_AW  = 64,
     parameter integer AXI_DW  = 64,
     parameter integer AXI_IDW = 4,
-    parameter integer IFW     = 16,   // input word FIFO depth, 64-bit words
-    parameter integer OFW     = 16    // output word FIFO depth
+    parameter integer IFW     = 8,    // input word FIFO depth, 64-bit words
+    parameter integer OFW     = 8     // output word FIFO depth
 ) (
     input  logic          clk,
     input  logic          rst_n,
