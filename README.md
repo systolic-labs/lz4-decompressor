@@ -40,13 +40,42 @@ There is no terminator, so the caller signals the end by asserting `in_last` wit
 the final byte of the block.  That byte is latched, because `in_last` is high for
 one cycle only.
 
-## Two levels
+## Three levels
 
 - **`lz4_decoder.v`** - the decoder itself: byte in, byte out, window external.
-- **`lz4_mmio.v`** - the same decoder as an AXI4-Lite peripheral for firmware to
-  drive four compressed bytes at a time, carrying its own 64 KiB window.
+- **`lz4_mmio.v`** - **legacy**, kept because its AXI-level bench still pins the
+  decoder: the decoder behind an AXI4-Lite register file, firmware feeding it
+  four compressed bytes at a time.  **It is no longer instantiated in the SoC**
+  (it reached 5 587 ms on the kernel) and its register map below is history.
+- **`lz4_engine.v`** - **what the SoC instantiates**: the decoder behind a
+  stream engine with its own AXI4 master (`lz4_axi.v`).  The CPU programmes
+  source, destination and length, pulses start, and polls done; the engine reads
+  the compressed block from DDR4 and writes the decompressed block back, so the
+  CPU never touches a byte of the stream.  **490 ms measured on the kernel**
+  against 5 587 ms for the MMIO drain.  See `doc/lz4_dma_engine.md`.
 
-### Register map of the MMIO wrapper
+### Register map of the engine (the one the SoC uses)
+
+| offset | access | meaning |
+|---|---|---|
+| `0x00` | W | bit0: start (self-clearing) |
+| `0x00` | R | bit0 busy, bit1 done, bit2 error |
+| `0x04` | W/R | source address `[31:0]` (compressed block, in DDR4) |
+| `0x08` | W/R | source address `[63:32]` |
+| `0x0C` | W/R | destination address `[31:0]` (decompressed block) |
+| `0x10` | W/R | destination address `[63:32]` |
+| `0x14` | W/R | compressed length in bytes |
+| `0x18` | R | decompressed bytes produced |
+| `0x1C` | W | debug selector |
+| `0x1C` | R | the selected counter: 0 read words, 1 written words, 2 bytes fed to the decoder, 3 non-OKAY responses, 4/5 the source XOR lo/hi, 6 the order-sensitive hash of the bytes handed to the decoder |
+
+The `0x1C` counters are not decoration: the engine's failure on silicon (a
+short, non-deterministic output) was localised with them - the source XOR and
+the ordered hash proved the reads and the feed were exact, which pointed at the
+packer, whose acceptance condition was dropping bytes whenever the output word
+FIFO filled (`doc/lz4_dma_engine.md`, "Silicium").
+
+### Register map of the MMIO wrapper (legacy)
 
 | offset | access | meaning |
 |---|---|---|
