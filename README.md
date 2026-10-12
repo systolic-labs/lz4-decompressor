@@ -3,14 +3,89 @@
 A byte-serial LZ4 decompressor for FPGAs, written from the published block-format
 description.  No code was taken from any unlicensed HDL source: `lib/lz4.c` in the
 reference implementation is BSD-2-Clause and AMD's Vitis LZ4 kernels are
-Apache-2.0, and both served as functional references only.
+Apache-2.0, and both served as functional references only (see `NOTICE`).
 
 It exists because no permissively-licensed LZ4 decompressor in plain Verilog with
 a standard window could be found.  A survey of GitHub, OpenCores, GitLab, Gitee
 and the academic literature turned up five hardware LZ4 implementations: two are
 HLS or bespoke ASIC flows, one is AGPL-3.0, one has no licence at all, and one
 has a 128-byte history window so it is not standard LZ4.  So this one was written
-and is released under Apache-2.0.
+and is released under Apache-2.0.  The survey is published in full, with the
+licence of each entry read from its own licence file, in
+`doc/lz4_hardware_survey.md`.
+
+## Getting started
+
+Three commands and no arguments:
+
+```sh
+git clone <this repository> && cd lz4-decoder
+make test          # every bench against every vector, ~40 s
+make help          # the options, and the tool variables
+```
+
+Icarus Verilog is the only dependency for the tests, and nothing but Python 3 for
+the vector generator.  There is no build system, no IP catalogue and no vendor
+tool in the flow: the benches are plain Verilog and the vectors are committed, so
+a fresh clone runs offline.
+
+```
+build/             # created by the harness, ignored by git
+rtl/               # the design
+tb/                # six self-checking benches
+vectors/           # in.hex + exp.hex + lens.vh per vector
+scripts/           # gen_vectors.py, run_tests.sh
+doc/               # design note, survey, resource reports
+doc/report/        # raw synthesis reports and serial captures
+```
+
+## Test vectors
+
+Every bench reads its data the same way, and this is the whole contract:
+
+```verilog
+`include "lens.vh"                          // `IN_LEN and `EXP_LEN
+$readmemh("in.hex",  input_bytes);          // the LZ4 block, one byte per line
+$readmemh("exp.hex", expect_bytes);         // the reference decompression
+```
+
+A vector is therefore a directory holding those three files, and the harness
+copies one into a scratch directory per run, because `$readmemh` resolves its
+argument against the *current* directory and not against the source file.
+
+Four vectors are committed, chosen for what they break rather than for size:
+
+| vector | what it exercises | compressed | output | ratio |
+|---|---|---:|---:|---:|
+| `tiny` | smoke test: text, so real matches at real distances | 723 B | 4 096 B | 5.67:1 |
+| `run4k` | an offset-1 run - the match source is the byte being written | 36 B | 4 016 B | 111.6:1 |
+| `run40k` | the same run, long enough to outlive a 16-bit counter | 177 B | 40 016 B | 226.1:1 |
+| `mixed` | text, runs and noise, output past the 64 KiB window wrap | 17 024 B | 98 304 B | 5.77:1 |
+
+`scripts/gen_vectors.py` rebuilds them from seeds, with the standard library
+only:
+
+```sh
+python3 scripts/gen_vectors.py                  # all four
+python3 scripts/gen_vectors.py --list           # what each one is
+python3 scripts/gen_vectors.py --from-file my.bin --name my   # your own data
+```
+
+and it can cut a large stream down to a simulatable block, which is how the
+kernel-image vector below was built:
+
+```sh
+# an lz4hc stream, cut at a sequence boundary and closed with a literal run
+python3 scripts/gen_vectors.py --from-lz4-stream Image.lz4hc --source Image \
+        --prefix-bytes 200000 --name kernel
+```
+
+If `python-lz4` is importable the generator decompresses everything it writes
+with a stock decoder and refuses to write a vector that one rejects.  That check
+is why the vectors end on a full literal run of at least five bytes: the RTL
+decoder is permissive and would happily accept a shorter one, but a vector only
+this decoder can read cannot tell you whether a failure is the design or the
+input.
 
 ## Cost, measured
 
@@ -25,7 +100,8 @@ Synthesised for `xcku5p-ffvb676-1-i` with Vivado 2025.2:
 
 For comparison, AMD's published `lz4_decompress` HLS kernel uses 703 LUTs and
 591 flip-flops.  The window memory is left to the caller, so the only storage is
-the 64 KiB you supply - eight BRAM36 tiles, or a slice of URAM.
+the 64 KiB you supply - eight BRAM36 tiles, or a slice of URAM.  The raw report is
+`doc/report/lz4_decoder.util.rpt`.
 
 ## Format
 
@@ -73,7 +149,7 @@ The `0x1C` counters are not decoration: the engine's failure on silicon (a
 short, non-deterministic output) was localised with them - the source XOR and
 the ordered hash proved the reads and the feed were exact, which pointed at the
 packer, whose acceptance condition was dropping bytes whenever the output word
-FIFO filled (`doc/lz4_dma_engine.md`, "Silicium").
+FIFO filled (`doc/lz4_dma_engine.md`, "Silicon").
 
 ### Register map of the MMIO wrapper (legacy)
 
@@ -123,16 +199,18 @@ registers rather than distributing it), less the count/snapshot logic it replace
 The window, and so the BRAM count, is untouched.
 
 The staging cost **+80 LUTs and +57 registers** over the byte-at-a-time wrapper
-(561 / 448 measured the same way at `43e79ec`): the 32-bit input staging, the
-INLEN counter, and the corrected output room test.  The BRAM count does not
-move.  (The 277 LUT / 291 register figure quoted in earlier revisions predates
-the staged output; it is not the cost of the current design.)
+(561 / 448, measured the same way before the staging landed): the 32-bit input
+staging, the INLEN counter, and the corrected output room test.  The BRAM count
+does not move.  (The 277 LUT / 291 register figure quoted in earlier revisions
+predates the staged output; it is not the cost of the current design.)
 
 The BRAM count is not an accident of the tool: it requires the window read to be
 **registered**.  A combinational read still passes simulation and is more
 permissive than the decoder's own contract, but Vivado cannot infer block RAM for
 an asynchronous read and falls back to distributed RAM - measured, that cost
 **13 926 LUTs**, fifty times more for the same function.
+
+Each of those figures is in `doc/report/` as a raw Vivado report.
 
 ## Interface
 
@@ -162,19 +240,32 @@ version was proven.
 
 ## Verification
 
-Self-checking, against a real stream from the reference compressor:
+Self-checking, against streams from the reference compressor:
 
 ```sh
-# decoder alone
-iverilog -g2012 -o tb_lz4 tb_lz4_decoder.v lz4_decoder.v && vvp tb_lz4
-# through the AXI peripheral, the way firmware drives it
-iverilog -g2012 -o tb_mmio tb_lz4_mmio.v lz4_mmio.v lz4_decoder.v && vvp tb_mmio
+make test                                    # all six benches, all four vectors
+scripts/run_tests.sh tb_lz4_decoder run40k   # one bench, one vector
 ```
 
-Validated on two vectors: a synthetic 64 KiB payload, and 256 KiB of a real Linux
-kernel image compressed at 2.07:1.  The second matters - it contains a single
-98 576-byte match with offset 1, a run whose source is the byte being written, and
-it exposed four bugs the easy vector could not:
+| bench | what it drives |
+|---|---|
+| `tb_lz4_decoder` | the decoder alone, byte in / byte out |
+| `tb_lz4_stream` | the buffered stream engine, and its cycles/byte |
+| `tb_lz4_axi` | the AXI4 master path against a modelled slave |
+| `tb_lz4_engine` | the engine's read/feed/write path, with a slow write slave |
+| `tb_lz4_engine_reg` | the engine through its register map |
+| `tb_lz4_mmio` | the legacy AXI4-Lite wrapper and its access count |
+
+Every bench checks the output byte for byte against `exp.hex` and prints
+`RESULT: PASS`, `RESULT: FAIL <reason>` or `TIMEOUT`; the harness turns that into
+an exit status.  The group-granular ports (AXI and MMIO) hand out eight bytes at a
+time, so the vectors' outputs are whole numbers of groups - the generator aligns
+them, which is what lets every bench run against every vector.
+
+Two vectors did the real work during development: a synthetic 64 KiB payload, and
+256 KiB of a real Linux kernel image compressed at 2.07:1.  The second matters -
+it contains a single 98 576-byte match with offset 1, a run whose source is the
+byte being written, and it exposed four bugs the easy vector could not:
 
 - a single-port window memory cannot read and write in the same cycle, which made
   the first match byte correct and every one after it undefined;
@@ -186,13 +277,25 @@ it exposed four bugs the easy vector could not:
   same address in one cycle, so an offset-1 run needs forwarding - latched, since
   the read is issued a cycle before its data is used.
 
-Each of those is commented in the source with its reason.
+Each of those is commented in the source with its reason.  The kernel vector
+itself is not shipped (`doc/lz4_decoder_resources.md` explains why, and how to
+rebuild one from any kernel `Image`); `run4k` and `run40k` are the shipped
+stand-ins for the offset-1 run, and `mixed` covers the window wrap.
 
 **On silicon (KU5P).**  The kernel's `klen` is exact (`00a95600`), all 1 387 200
 output groups are drained with none lost or duplicated (`groupes` = produced/8),
 and the LZ4 stage is **5 587 ms against 7 060 ms** for the previous drain.  Raw
-console: `doc/report/lz4_out_fifo_autoincrement.console.txt`.
+console: `doc/report/lz4_out_fifo_autoincrement.console.txt`.  The engine path
+that replaced it measured **490 ms** on the same bitstream, with the source
+checksum and ordered hash agreeing with the CPU's and Linux booting to a shell
+prompt: `doc/report/lz4_engine.console.txt`,
+`doc/report/lz4_engine_linux.console.txt`.
 
 ## Licence
 
 Apache-2.0.  See `LICENSE`.
+
+`NOTICE` records the two upstream works this design was written against - the LZ4
+reference implementation (BSD-2-Clause) and AMD's Vitis LZ4 kernels
+(Apache-2.0) - and states what was and was not taken from them.  No code from
+either is present in this repository.
