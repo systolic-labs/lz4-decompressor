@@ -1,0 +1,50 @@
+lz4-decoder
+Copyright 2026 the lz4-decoder authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+
+Functional references
+=====================
+
+The LZ4 block decompressor in rtl/ was written from the published block-format
+description.  No code was copied from any of the works below; they are listed
+because they shaped the design, supplied the test data, or are the comparison
+this block is measured against.
+
+
+1. LZ4 reference implementation - lib/lz4.c, lib/lz4.h, lib/lz4hc.c, lib/lz4hc.h
+   Copyright (c) Yann Collet. All rights reserved.
+   BSD 2-Clause License - https://opensource.org/licenses/bsd-license.php
+   https://github.com/lz4/lz4
+
+   Used as the normative definition of the block format and as the compressor
+   that produced the test streams.  The streams under vectors/ were produced by
+   linking the unmodified library (or the equivalent python-lz4 binding) and
+   compressing our own data; no part of the library is present in this
+   repository, and nothing here is derived from its code.
+
+
+2. AMD/Xilinx Vitis Data Compression library - LZ4 kernels
+   (Xilinx/Vitis_Libraries, data_compression/, tags v2022.1-v2024.1)
+   Apache License 2.0
+
+   Prior art and the resource comparison quoted in the README and in
+   doc/lz4_hardware_survey.md (L1 lz4_decompress: 703 LUTs, 591 flip-flops,
+   32 BRAM, 375 MHz on XCU200).  No code from it is present here, and the
+   figures are quoted from AMD's published reports, not re-measured by us.
+
+
+3. Test input not redistributed
+
+   During development one vector was a 256 KiB slice of a Linux kernel `Image`
+   (GPL-2.0) compressed with lz4hc.  It is not shipped here, because its
+   decompressed form is kernel code and this drop is Apache-2.0.
+   doc/lz4_decoder_resources.md records what it proved and
+   scripts/gen_vectors.py can rebuild an equivalent one from any kernel Image.
+
+
+Nothing in this repository is derived from the copyright holder of the LZ4
+reference implementation beyond the format itself, which is an open
+specification: this is an independent implementation of a published file format,
+not a port.
