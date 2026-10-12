@@ -1,0 +1,11 @@
+# Simulation work directory (the harness writes one directory per bench/vector).
+build/
+
+# Icarus Verilog output
+*.vvp
+*.vcd
+
+# Editor and OS noise
+*.swp
+*~
+.DS_Store
