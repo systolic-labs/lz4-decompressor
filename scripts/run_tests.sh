@@ -31,8 +31,13 @@ IV=${IV:-iverilog}
 VVP=${VVP:-vvp}
 RUN_TIMEOUT=${RUN_TIMEOUT:-900}
 
-ALL_BENCHES=(tb_lz4_decoder tb_lz4_mmio tb_lz4_stream tb_lz4_axi tb_lz4_engine tb_lz4_engine_reg)
+ALL_BENCHES=(tb_lz4_decoder tb_lz4_decoder_edges tb_lz4_mmio tb_lz4_stream tb_lz4_axi tb_lz4_engine tb_lz4_engine_reg tb_lz4_engine_rst)
 ALL_VECTORS=(tiny run4k run40k mixed)
+
+# Benches that build their own stimulus and read no vector: they run once, from
+# SELF_VECTOR's directory, which they need only because the harness passes -I.
+SELF_BENCHES=(tb_lz4_decoder_edges)
+SELF_VECTOR=tiny
 
 usage() {
     sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
@@ -68,7 +73,9 @@ printf '=== LZ4 testbenches: %d bench(es) x %d vector(s), timeout %ss ===\n\n' \
 
 for bench in "${benches[@]}"; do
     [ -f "$TB/$bench.v" ] || { printf 'missing bench: %s\n' "$TB/$bench.v" >&2; exit 2; }
-    for vec in "${vectors[@]}"; do
+    bvec=("${vectors[@]}")
+    if contains "$bench" "${SELF_BENCHES[@]}"; then bvec=("$SELF_VECTOR"); fi
+    for vec in "${bvec[@]}"; do
         vdir=$VECDIR/$vec
         if [ ! -f "$vdir/in.hex" ] || [ ! -f "$vdir/exp.hex" ] || [ ! -f "$vdir/lens.vh" ]; then
             printf 'FAIL  %-18s %-7s  vector incomplete (need in.hex, exp.hex, lens.vh)\n' "$bench" "$vec"
@@ -94,13 +101,16 @@ for bench in "${benches[@]}"; do
         (cd "$run" && timeout "$RUN_TIMEOUT" "$VVP" sim) >"$run/run.log" 2>&1 || rc=$?
         elapsed=$((SECONDS - start))
 
-        if grep -q 'RESULT: PASS' "$run/run.log"; then
-            printf 'PASS  %-18s %-7s  %3ss\n' "$bench" "$vec" "$elapsed"
+        # The LAST RESULT line is the verdict.  A bench may print per-case
+        # progress first, and matching any "RESULT: PASS" would hide a final
+        # failure behind one passing case.
+        verdict=$(grep -ao 'RESULT: .*' "$run/run.log" | tail -1)
+        if [ "$verdict" = "RESULT: PASS" ]; then
+            printf 'PASS  %-22s %-7s  %3ss\n' "$bench" "$vec" "$elapsed"
             pass=$((pass + 1))
         else
-            verdict=$(grep -aoE 'RESULT: [A-Za-z-]+|TIMEOUT[^"]*' "$run/run.log" | tail -1)
             [ -n "$verdict" ] || verdict="no verdict, vvp exit $rc"
-            printf 'FAIL  %-18s %-7s  %3ss  %s\n' "$bench" "$vec" "$elapsed" "$verdict"
+            printf 'FAIL  %-22s %-7s  %3ss  %s\n' "$bench" "$vec" "$elapsed" "$verdict"
             printf '      log: %s\n' "$run/run.log"
             fail=$((fail + 1)); failed+=("$bench/$vec")
         fi
