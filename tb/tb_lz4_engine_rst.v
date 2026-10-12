@@ -303,6 +303,56 @@ module tb_lz4_engine_rst;
         end
         cases = cases + 1;
 
+        // ==================================================================
+        $display("==================================================");
+        $display(" C. output length not a whole number of 8-byte words");
+        $display("==================================================");
+        // Every shipped vector decompresses to a multiple of 8 bytes, so the
+        // engine's flush of a partial accumulator - flush_req, with byte strobes
+        // on the final write - is never reached by them.  Build a block that ends
+        // mid-word: 12 literals, an offset-1 run of 64, then 6 literals = 82.
+        begin : partial_final_word
+            integer j, nl, blen, elen;
+            reg [7:0] blk [0:127];
+            reg [7:0] exp2 [0:255];
+            nl = 0;
+            blk[nl] = 8'hCF; nl = nl + 1;                 // 12 literals, match nibble 15
+            for (j = 0; j < 12; j = j + 1) begin blk[nl] = 8'h41 + j[7:0]; nl = nl + 1; end
+            blk[nl] = 8'h01; nl = nl + 1;                 // offset 1
+            blk[nl] = 8'h00; nl = nl + 1;
+            blk[nl] = 8'd45; nl = nl + 1;                 // match length 64 - 19
+            blk[nl] = 8'h60; nl = nl + 1;                 // final sequence: 6 literals
+            for (j = 0; j < 6; j = j + 1) begin blk[nl] = 8'hE0 + j[7:0]; nl = nl + 1; end
+            blen = nl;
+            elen = 0;
+            for (j = 0; j < 12; j = j + 1) begin exp2[elen] = 8'h41 + j[7:0]; elen = elen + 1; end
+            for (j = 0; j < 64; j = j + 1) begin exp2[elen] = exp2[elen - 1]; elen = elen + 1; end
+            for (j = 0; j < 6; j = j + 1) begin exp2[elen] = 8'hE0 + j[7:0]; elen = elen + 1; end
+
+            $display("  case: %0d compressed -> %0d bytes out (%0d bytes past the last word)",
+                     blen, elen, 8 - (elen % 8));
+            clear_region(SRC, blen);
+            clear_region(DST, elen + 16);
+            for (j = 0; j < blen; j = j + 1) poke(SRC + j, blk[j]);
+            run_block(SRC, DST, blen, 200000);
+            errs = 0;
+            for (j = 0; j < elen; j = j + 1)
+                if (peek(DST + j) !== exp2[j]) errs = errs + 1;
+            // The strobes on the final write must cover only the live bytes.
+            for (j = elen; j < elen + 8; j = j + 1)
+                if (peek(DST + j) !== 8'h00) errs = errs + 100;
+            if (!saw_done) begin
+                $display("    [BAD]  never completed (error %b)", saw_error);
+                fails = fails + 1;
+            end else if (errs != 0) begin
+                $display("    [BAD]  %0d wrong or clobbered bytes after the flush", errs);
+                fails = fails + 1;
+            end else begin
+                $display("    [ok]   %0d bytes exact, and the bytes past them untouched", elen);
+            end
+            cases = cases + 1;
+        end
+
         $display("==================================================");
         verdict = "PASS";
         if (fails != 0) verdict = "FAIL engine rules";

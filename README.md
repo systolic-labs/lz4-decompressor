@@ -308,7 +308,7 @@ scripts/run_tests.sh tb_lz4_decoder run40k   # one bench, one vector
 | `tb_lz4_axi` | the AXI4 master path against a modelled slave |
 | `tb_lz4_engine` | the engine's read/feed/write path, with a slow write slave |
 | `tb_lz4_engine_reg` | the engine through its register map |
-| `tb_lz4_engine_rst` | AXI4 burst rules on every AR/AW, and restart after a truncated block |
+| `tb_lz4_engine_rst` | AXI4 burst rules on every AR/AW, restart after a truncated block, and the partial final word |
 | `tb_lz4_mmio` | the legacy AXI4-Lite wrapper and its access count |
 
 Every bench checks the output byte for byte against `exp.hex` and prints
