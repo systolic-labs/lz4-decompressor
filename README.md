@@ -151,6 +151,23 @@ the ordered hash proved the reads and the feed were exact, which pointed at the
 packer, whose acceptance condition was dropping bytes whenever the output word
 FIFO filled (`doc/lz4_dma_engine.md`, "Silicon").
 
+### Engine addressing
+
+`lz4_axi` moves 8-byte beats, so **`src_addr` and `dst_addr` must be 8-byte
+aligned**.  A misaligned address is refused at `start` with `error` asserted and
+no transfer issued.
+
+The reason is an AXI4 rule: an INCR burst must not cross a 4 KiB aligned
+boundary.  On aligned addresses the engine cannot break it - it is single-beat
+(`arlen`/`awlen` are 0) and 4096 is a multiple of 8, so no 8-byte beat can
+straddle a line, whatever the length.  A misaligned address is the only way to
+cross one, and it would also put the written bytes at the wrong offsets.  A bench
+monitors every AR and AW and asserts both properties.
+
+An earlier revision of this file's header claimed the reads were issued as
+bursts; that was reverted on silicon (see the note above the input path) and the
+header now matches the code.
+
 ### Register map of the MMIO wrapper (legacy)
 
 | offset | access | meaning |
@@ -229,6 +246,42 @@ cycle of latency.  `win_raddr` is presented continuously; the byte it addresses
 appears on `win_rdata` in the following cycle.  A byte is written whenever
 `out_valid` is high.
 
+### Output handshake
+
+The output is a **one-entry holding register**: `out_valid` stays high with the
+same `out_data` until the consumer asserts `out_ready`, and a byte moves on
+`out_valid && out_ready`.  A byte is never withdrawn without a handshake.
+
+This is worth stating because an earlier revision pulsed `out_valid` for one
+cycle and gated production on `out_ready` in the *preceding* cycle, so a consumer
+that deasserted `out_ready` in the cycle the byte appeared lost it silently.
+Measured with a randomised `out_ready`: 82 bytes presented, 38 accepted, 44 lost.
+Every wrapper here had compensated by counting an "in-flight" byte inside its own
+room test, which is why it survived review - both sides had been tuned to the
+same misunderstanding, and the two errors cancelled.  With the holding register
+each wrapper's `out_ready` is a plain room test again.
+
+`in_ready` is combinational and asserts only when the holding register can take a
+byte in that cycle, so back-pressure on either side **stalls rather than drops**.
+
+Re-measured after the change: `tb_lz4_stream` and `tb_lz4_engine` both report
+**1.94 cycles per output byte** on the `mixed` vector, inside the 1.86-2.00 the
+buffered engine held before, so the holding register costs no throughput when the
+sink is ready.
+
+### Malformed input
+
+A block ends on the last literal of its final sequence.  If `in_last` arrives
+anywhere else - on a length-extension byte, on either offset byte, on a token
+that declares anything, or with literals still expected - the block is truncated:
+the decoder raises `error` and stops, instead of waiting for input that will never
+come or returning a short output that looks like a valid decode.  An offset of 0
+is rejected the same way: it is not a distance, and the read would alias the
+address being written.
+
+`done` is asserted only once the output register is empty, so a consumer that
+stops on `done` has the whole block.
+
 ## Throughput
 
 One byte per clock while copying literals, two per matched byte: one cycle to
@@ -250,10 +303,12 @@ scripts/run_tests.sh tb_lz4_decoder run40k   # one bench, one vector
 | bench | what it drives |
 |---|---|
 | `tb_lz4_decoder` | the decoder alone, byte in / byte out |
+| `tb_lz4_decoder_edges` | directed corners: offset sweep, randomised `out_ready`, truncated and malformed blocks |
 | `tb_lz4_stream` | the buffered stream engine, and its cycles/byte |
 | `tb_lz4_axi` | the AXI4 master path against a modelled slave |
 | `tb_lz4_engine` | the engine's read/feed/write path, with a slow write slave |
 | `tb_lz4_engine_reg` | the engine through its register map |
+| `tb_lz4_engine_rst` | AXI4 burst rules on every AR/AW, and restart after a truncated block |
 | `tb_lz4_mmio` | the legacy AXI4-Lite wrapper and its access count |
 
 Every bench checks the output byte for byte against `exp.hex` and prints
@@ -290,6 +345,13 @@ that replaced it measured **490 ms** on the same bitstream, with the source
 checksum and ordered hash agreeing with the CPU's and Linux booting to a shell
 prompt: `doc/report/lz4_engine.console.txt`,
 `doc/report/lz4_engine_linux.console.txt`.
+
+Those captures predate the output-handshake fix, the malformed-input guards, the
+alignment check and the per-block restart.  None of them changes what is decoded
+- the benches re-validate every shipped vector byte for byte - and the cycle cost
+is unchanged (1.94 cycles/output byte measured after, against 1.86-2.00 before).
+They are still measurements of *that* bitstream, and the next one should be
+re-measured rather than assumed.
 
 ## Licence
 
