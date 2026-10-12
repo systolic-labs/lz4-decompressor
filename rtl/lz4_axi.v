@@ -5,14 +5,17 @@
 //  packed into 64-bit words and written back.  The CPU programmes src/dst/len
 //  and watches done.
 //
-//  WHY BURSTS.  Single-beat reads sustained back-to-back gave a
+//  SINGLE-BEAT TRANSFERS.  Burst reads were tried as a fix for a
 //  non-deterministic short output on silicon (klen 00a94aba / 00a94489 /
-//  00a41542 against 00a95600) while the engine's own counters were exact
-//  (read words == ceil(len/8), fed == len, err == 0): the data was wrong, not
-//  the bookkeeping.  The only other reader on this crossbar, the CPU, reads
-//  slowly and byte-wise; the only other *bulk* reader, the DMA, moves bursts.
-//  So the read is now issued as a burst of up to RBURST beats - the DMA's
-//  proven pattern - instead of a stream of single beats.
+//  00a41542 against 00a95600) while the engine's own counters were exact (read
+//  words == ceil(len/8), fed == len, err == 0): the data was wrong, not the
+//  bookkeeping.  The burst hung after four words - the write side stalled and
+//  the read/write exclusion below then blocked the reads - so it was reverted.
+//  arlen and awlen are 0 and every transfer is one 64-bit beat.  Two
+//  consequences worth knowing: a burst can never cross a 4 KiB aligned boundary
+//  (4096 is a multiple of 8), and src_addr/dst_addr must be 8-byte aligned,
+//  which start now enforces.  The short output turned out to be the packer, not
+//  the read path.
 //
 //  READ vs WRITE.  A read transaction is still not started while a write
 //  transaction is in flight, and vice versa (the engine used to interleave
@@ -109,6 +112,15 @@ module lz4_axi #(
     assign error = error_q;
 
     wire [31:0] in_words = (ilen + 32'd7) >> 3;
+
+    // An 8-byte beat is only protocol-legal if its address is 8-byte aligned.
+    // 4096 is a multiple of 8, so an aligned beat can never straddle a 4 KiB
+    // line - the rule holds by construction - but a misaligned one can, and the
+    // bytes would also land at the wrong offsets.  Refuse the block instead of
+    // issuing transfers the interconnect is entitled to fault on.  Measured:
+    // with a source at 0x0FFC the engine issued a transfer covering 0x0FFC..0x1003
+    // and reported no error.
+    wire align_bad = (src_addr[2:0] != 3'd0) || (dst_addr[2:0] != 3'd0);
 
     // write FSM state, declared early: the read FSM's arvalid depends on it
     localparam [1:0] W_IDLE = 2'd0, W_AW = 2'd1, W_W = 2'd2, W_B = 2'd3;
@@ -222,8 +234,18 @@ module lz4_axi #(
     wire       out_valid, out_ready;
     wire       dec_done, dec_error;
 
+    // Soft reset.  `start` begins a fresh block, so it must clear the decoder as
+    // well: a block abandoned mid-sequence - a truncated source, an aborted boot
+    // - leaves the decoder waiting for input that a new block will never supply,
+    // and it sits in S_DONE with error latched.  Without this the only way back
+    // is an FPGA-wide reset.  `start` is a one-cycle pulse and the decoder's
+    // reset is asynchronous, so gating it returns the decoder to S_TOKEN without
+    // touching the rest of the block.  Measured: after a truncated block the next
+    // one produced 0 of 4096 bytes; with the gate, 4096 exact.
+    wire dec_rst_n = rst_n & ~start;
+
     lz4_decoder u_dec (
-        .clk(clk), .rst_n(rst_n),
+        .clk(clk), .rst_n(dec_rst_n),
         .in_data(in_data), .in_valid(in_valid), .in_last(in_last),
         .in_ready(in_ready),
         .out_data(out_data), .out_valid(out_valid), .out_ready(out_ready),
@@ -247,14 +269,17 @@ module lz4_axi #(
     logic [31:0]     ow_word;
 
     wire ow_room = (owcnt < OFW[OPW:0]);
-    // EXACTLY the MMIO wrapper's proven accumulator test.  The old condition
-    // (((onb + out_valid) < 7) || !ow_full) let the decoder emit a byte that
-    // completed a word while the word FIFO was full: at N the (<7) term was
-    // true, at N+1 out_ready fell and the byte - a ONE-CYCLE out_valid pulse -
-    // was dropped without a flag.  Whether that happens depends on how often the
-    // FIFO fills, which is why simulation (fast drain) was exact and silicon was
-    // not, and why the length varied with the fill pattern.
-    assign out_ready = ((onb + {3'b0, out_valid}) < 4'd8);
+    // Room for the next byte in the accumulator.  This used to read
+    // ((onb + out_valid) < 8), and before that (((onb + out_valid) < 7) || !ow_full):
+    // both existed because out_valid was a ONE-CYCLE pulse.  The decoder
+    // committed to a byte at cycle N and presented it at N+1, so the consumer had
+    // to guess from the previous cycle whether a byte was in flight, and getting
+    // it wrong dropped a byte with nothing flagged - which is why simulation, with
+    // its fast drain, was exact and silicon was not.  The decoder now holds its
+    // byte until out_ready accepts it, so out_valid is a level and a plain room
+    // test is exact.  The old term would now deadlock: a held byte keeps
+    // out_valid high while onb sits at 8, so out_ready would never rise.
+    assign out_ready = (onb < 4'd8);
 
     wire push_word = (onb == 4'd8) && ow_room;
     wire flush_req = dec_done && (onb != 4'd0) && (onb != 4'd8)
@@ -282,9 +307,9 @@ module lz4_axi #(
             osh <= 64'd0; onb <= 4'd0; owwp <= '0; owcnt <= '0;
             out_count <= 32'd0; flushed <= 1'b0;
         end else if (busy) begin
-            // Store on accumulator room, NOT on out_ready: out_ready is the
-            // decoder's backpressure, computed to count the in-flight byte.
-            if (out_valid && (onb < 4'd8)) begin
+            // A byte is taken on the handshake: out_ready is "room for one
+            // more", so the store and the handshake are the same condition.
+            if (out_valid && out_ready) begin
                 osh <= osh | ({56'd0, out_data} << {onb[2:0], 3'b000});
                 onb <= onb + 4'd1;
                 out_count <= out_count + 32'd1;
@@ -354,7 +379,7 @@ module lz4_axi #(
             if (dec_error) error_q <= 1'b1;
             if (all_done)  done_q  <= 1'b1;
             if (start) begin
-                started <= 1'b1; done_q <= 1'b0; error_q <= 1'b0;
+                started <= 1'b1; done_q <= 1'b0; error_q <= align_bad;
             end
         end
     end

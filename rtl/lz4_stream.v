@@ -98,15 +98,22 @@ module lz4_stream #(
     wire out_valid, out_ready;
     wire [7:0] out_data;
 
-    // Room for the decoder's next byte, counting the one already in flight -
-    // the same test the MMIO wrapper uses, and for the same reason: out_valid is
-    // registered, so a plain (o_cnt < OFIFO) lets one byte too many be offered
-    // and it is dropped without a flag.
-    assign out_ready = ((o_cnt + {7'd0, out_valid}) < OFIFO[7:0]);
+    // Room for the decoder's next byte.  The old test
+    // ((o_cnt + out_valid) < OFIFO) counted a byte the decoder had committed to
+    // emitting while out_valid was still a one-cycle pulse.  It now holds a byte
+    // until it is taken, so out_valid is a level and the plain room test is
+    // exact; keeping the old form would deadlock at the top of the FIFO.
+    assign out_ready = (o_cnt < OFIFO[7:0]);
     wire dec_done, dec_error;
 
+    // `start` begins a fresh block, so it must clear the decoder too: a block
+    // abandoned mid-sequence leaves it waiting for input that the next block will
+    // never supply.  start is a pulse and the reset is asynchronous, so gating it
+    // is enough.
+    wire dec_rst_n = rst_n & ~start;
+
     lz4_decoder u_dec (
-        .clk(clk), .rst_n(rst_n),
+        .clk(clk), .rst_n(dec_rst_n),
         .in_data(in_data), .in_valid(in_valid), .in_last(in_last),
         .in_ready(in_ready),
         .out_data(out_data), .out_valid(out_valid), .out_ready(out_ready),
@@ -115,7 +122,7 @@ module lz4_stream #(
         .done(dec_done), .error(dec_error)
     );
 
-    wire o_push  = out_valid;                 // out_ready is high whenever room
+    wire o_push  = out_valid && out_ready;    // a byte moves on the handshake
     wire o_drain = (o_cnt != 8'd0);
     assign dst_we    = busy && o_drain;
     assign dst_waddr = out_count;

@@ -204,18 +204,16 @@ module lz4_mmio #(
     logic           o_tail_done;    // the final partial group has been pushed
     logic [31:0]    groups_taken;   // groups software popped (lost-group instrument)
 
-    // Room for the decoder's next byte, counting the one already in flight.
-    // The decoder decides to emit at cycle N when out_ready is high, but
-    // out_valid rises at N+1 - by which time o_cnt has been advanced by the
-    // previous pulse.  A plain (o_cnt < 8) therefore lets the decoder emit one
-    // byte too many, for which the staging register has no room: the byte is
-    // DROPPED silently, once per time the staging saturates, and the stream is
-    // short by that many bytes with no error flagged.  Measured on the real
-    // kernel prefix: 7 drops over 12 008 output bytes.  The in-flight byte must
-    // be counted here.  With the FIFO, the accumulator is only a staging area
-    // that empties itself into the FIFO, so this exact test still holds and the
-    // extra buffering is the FIFO's, not the accumulator's.
-    wire out_ready = ((o_cnt + {3'd0, out_valid}) < 4'd8);
+    // Room for the decoder's next byte.  This used to read
+    // ((o_cnt + out_valid) < 8), counting the byte the decoder had already
+    // committed to emitting at cycle N and would present at N+1, because
+    // out_valid was a ONE-CYCLE pulse: a plain (o_cnt < 8) let one byte too many
+    // be offered and it was dropped silently - measured on the real kernel
+    // prefix, 7 drops over 12 008 output bytes.  The decoder now holds its byte
+    // until out_ready accepts it, so out_valid is a level and the plain room
+    // test is exact.  Keeping the old formula would deadlock instead of dropping:
+    // with o_cnt at 8 and a byte held, out_ready would never rise again.
+    wire out_ready = (o_cnt < 4'd8);
 
     // Staging is non-empty exactly when a byte is presented to the decoder.
     wire in_valid = (i_cnt != 3'd0);
@@ -235,9 +233,16 @@ module lz4_mmio #(
     // groups_taken): [5] last_taken, [4] started, [3:0] groups ready.
     wire [31:0] stat_word = {26'd0, last_taken, started, ofill};
 
+    // A CTRL bit0 write begins a fresh block, so it must clear the decoder as
+    // well: a block abandoned mid-sequence leaves it waiting for input the next
+    // block will never supply (or parked in S_DONE with error latched), which
+    // otherwise needs a whole-subsystem reset to clear.
+    wire start_w   = wr_hit && (wr_reg == 4'd0) && s_wdata[0];
+    wire dec_rst_n = rst_n & ~start_w;
+
     lz4_decoder u_dec (
         .clk        (clk),
-        .rst_n      (rst_n),
+        .rst_n      (dec_rst_n),
         .in_data    (in_byte),
         .in_valid   (in_valid),
         .in_last    (in_last_q),
@@ -272,7 +277,7 @@ module lz4_mmio #(
             end
 
             // Accumulate the decoder's output byte into the 8-byte group.
-            if (out_valid && (o_cnt < 4'd8)) begin
+            if (out_valid && out_ready) begin
                 o_stage   <= o_stage | (({56'd0, out_data}) << ({o_cnt, 3'b000}));
                 o_cnt     <= o_cnt + 4'd1;
                 out_count <= out_count + 32'd1;

@@ -44,8 +44,16 @@
 //  rising edge with the write address taking priority over the read.
 //
 //  HANDSHAKE.  in_ready is combinational; a byte is consumed on
-//  in_valid && in_ready.  The match phase stalls on out_ready rather than
-//  dropping bytes.
+//  in_valid && in_ready.  The output is a one-entry holding register: out_valid
+//  stays high with the same out_data until the consumer asserts out_ready, so a
+//  byte is never withdrawn without a handshake.  Both sides stall rather than
+//  drop.
+//
+//  MALFORMED INPUT.  A block that ends anywhere but on the final literal of its
+//  last sequence is truncated: the decoder raises error and stops, rather than
+//  waiting for input that will not come or returning a short output that looks
+//  like a valid decode.  An offset of 0 is rejected for the same reason - it is
+//  not a distance, and accepting it turns a corrupt stream into a plausible run.
 // ============================================================================
 `default_nettype none
 
@@ -122,7 +130,12 @@ module lz4_decoder (
     // the sequence lost a byte.  On silicon the CPU's drain is far slower than
     // the decoder, so that came up constantly.  Refusing input while a byte is
     // waiting costs nothing: the decoder drains its output on its own.
-    assign in_ready = (!out_ready) ? 1'b0 :
+    // The output stage is a one-entry holding register: a byte is presented
+    // until the consumer takes it.  "Free" means the register holds nothing, or
+    // holds a byte that is being accepted in this cycle.
+    wire out_free = ~out_valid | out_ready;
+
+    assign in_ready = (!out_free) ? 1'b0 :
                       (st == S_TOKEN)   ? 1'b1 :
                       (st == S_LITEXT)  ? 1'b1 :
                       (st == S_OFF_LO)  ? 1'b1 :
@@ -171,7 +184,13 @@ module lz4_decoder (
             error      <= 1'b0;
         end else begin
             done      <= 1'b0;
-            out_valid <= 1'b0;
+            // Clear the output register only on an accepted byte, so it holds
+            // its value across a stall.  A plain `out_valid <= 1'b0` withdraws a
+            // byte that was never taken: the byte produced in cycle N is
+            // presented in N+1, and if out_ready fell in N+1 the byte vanished
+            // with nothing flagged.  Measured with a randomised out_ready: 82
+            // valid pulses, 38 accepted, 44 bytes lost.
+            if (out_valid && out_ready) out_valid <= 1'b0;
 
             // Latch the forwarded byte when this cycle's read hits the address the
             // emitted byte is being written to.
@@ -187,16 +206,30 @@ module lz4_decoder (
             // ------------------------------------------------------- token
             S_TOKEN: begin
                 if (taking) begin
-                    litlen     <= {12'd0, in_data[7:4]};
-                    mlen       <= {12'd0, in_data[3:0]};
-                    saved_last <= in_last;
-                    st         <= (in_data[7:4] == 4'd15) ? S_LITEXT : S_LITERAL;
+                    // The only token that can be the last byte of a block is the
+                    // empty one: any other declares literals or a match that the
+                    // stream must still contain, so ending here is a truncation.
+                    if (in_last && (in_data != 8'h00)) begin
+                        error <= 1'b1;
+                        st    <= S_DONE;
+                    end else begin
+                        litlen     <= {12'd0, in_data[7:4]};
+                        mlen       <= {12'd0, in_data[3:0]};
+                        saved_last <= in_last;
+                        st         <= (in_data[7:4] == 4'd15) ? S_LITEXT : S_LITERAL;
+                    end
                 end
             end
 
             // ---------------------------------- literal-length continuation
+            // A length extension saying "continue" cannot be the last byte of the
+            // block: the stream is truncated, and waiting for input that will
+            // never arrive would hang the engine with busy asserted and no error.
             S_LITEXT: begin
-                if (taking) begin
+                if (taking && in_last) begin
+                    error <= 1'b1;
+                    st    <= S_DONE;
+                end else if (taking) begin
                     litlen     <= litlen + {8'd0, in_data};
                     saved_last <= in_last;
                     if (in_data != 8'hFF) st <= S_LITERAL;
@@ -206,30 +239,59 @@ module lz4_decoder (
             // ---------------------------------------------------- literals
             S_LITERAL: begin
                 if (litlen == 32'd0) begin
-                    // Sequence done; the block ends here if the last input byte
-                    // was consumed in this state.
-                    st <= saved_last ? S_DONE : S_OFF_LO;
+                    // A token whose match nibble is non-zero declares a match the
+                    // block must still contain.  Ending here means the stream was
+                    // cut short, not that the block finished: report it instead of
+                    // returning a short output that looks like a valid decode.
+                    if (saved_last && (mlen != 32'd0)) begin
+                        error <= 1'b1;
+                        st    <= S_DONE;
+                    end else begin
+                        st <= saved_last ? S_DONE : S_OFF_LO;
+                    end
                 end else if (taking) begin
-                    out_data   <= in_data;
-                    out_valid  <= 1'b1;
-                    waddr      <= opos[15:0];   // address of *this* byte
-                    opos       <= opos + 32'd1;
-                    litlen     <= litlen - 32'd1;
-                    saved_last <= in_last;
+                    // The last byte of a block is the last literal of its final
+                    // sequence, so consuming it with literals still expected means
+                    // the stream stopped early.  Without this the decoder waits in
+                    // S_LITERAL for literals that will never arrive.
+                    if (in_last && (litlen != 32'd1)) begin
+                        error <= 1'b1;
+                        st    <= S_DONE;
+                    end else begin
+                        out_data   <= in_data;
+                        out_valid  <= 1'b1;
+                        waddr      <= opos[15:0];   // address of *this* byte
+                        opos       <= opos + 32'd1;
+                        litlen     <= litlen - 32'd1;
+                        saved_last <= in_last;
+                    end
                 end
             end
 
             // ------------------------------------------------ match offset
+            // Neither offset byte may be the last byte of the block: the match
+            // cannot be completed, so this is a truncated stream.
             S_OFF_LO: begin
-                if (taking) begin
+                if (taking && in_last) begin
+                    error <= 1'b1;
+                    st    <= S_DONE;
+                end else if (taking) begin
                     offset_lo <= {8'd0, in_data};
                     st        <= S_OFF_HI;
                 end
             end
             S_OFF_HI: begin
-                if (taking) begin
+                if (taking && in_last) begin
+                    error <= 1'b1;
+                    st    <= S_DONE;
+                end else if (taking) begin
                     offset <= {in_data, offset_lo[7:0]};
-                    if ({17'd0, in_data, offset_lo[7:0]} > opos_ext) begin
+                    // Offset 0 is not a distance: LZ4 requires at least 1.  The
+                    // read would alias the address being written and the
+                    // forwarding latch would turn a corrupt stream into a
+                    // plausible-looking run, with nothing flagged.
+                    if (({in_data, offset_lo[7:0]} == 16'd0) ||
+                        ({17'd0, in_data, offset_lo[7:0]} > opos_ext)) begin
                         error <= 1'b1;
                         st    <= S_DONE;
                     end else begin
@@ -241,7 +303,10 @@ module lz4_decoder (
 
             // ------------------------------------ match-length continuation
             S_MATEXT: begin
-                if (taking) begin
+                if (taking && in_last) begin
+                    error <= 1'b1;
+                    st    <= S_DONE;
+                end else if (taking) begin
                     mlen <= mlen + {8'd0, in_data};
                     if (in_data != 8'hFF) st <= S_MREAD;
                 end
@@ -257,7 +322,7 @@ module lz4_decoder (
 
             // ------------------------------------------------ match: write
             S_MWRITE: begin
-                if (out_ready) begin
+                if (out_free) begin
                     out_data  <= rd_eff;        // read issued in S_MREAD, forwarded if it aliased the write
                     out_valid <= 1'b1;
                     waddr     <= opos[15:0];
@@ -269,7 +334,9 @@ module lz4_decoder (
 
             // -------------------------------------------------------- done
             S_DONE: begin
-                done <= 1'b1;
+                // Do not report completion while a byte is still held: a consumer
+                // that sees done and stops reading would leave that byte behind.
+                if (out_free) done <= 1'b1;
             end
 
             endcase
