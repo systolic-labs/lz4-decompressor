@@ -138,13 +138,6 @@ module lz4_mmio #(
     logic [31:0] i_stage;   // staged compressed bytes; byte 0 is consumed next
     logic [2:0]  i_cnt;     // staged bytes not yet consumed, 0..4
     logic [31:0] i_len;     // compressed block length; in_last fires on its last byte
-    wire  [7:0]  in_byte   = i_stage[7:0];
-    wire         in_last_q = (take_count == (i_len - 32'd1));
-    logic        in_ready, out_valid;
-    logic [7:0]  out_data;
-    logic        dec_done, dec_error;
-    logic        done_q, error_q, started;
-    logic [31:0] in_count, out_count;
     // Instrumentation, because two different wrappers produced the same wrong
     // output length on silicon (13 190 715 against 11 097 600) while simulation
     // passed.  take_count is what the DECODER actually consumed and last_taken
@@ -152,6 +145,13 @@ module lz4_mmio #(
     // wrapper loses input" from "the decoder misses the end of the block".
     logic [31:0] take_count;
     logic        last_taken;
+    wire  [7:0]  in_byte   = i_stage[7:0];
+    wire         in_last_q = (take_count == (i_len - 32'd1));
+    logic        in_ready, out_valid;
+    logic [7:0]  out_data;
+    logic        dec_done, dec_error;
+    logic        done_q, error_q, started;
+    logic [31:0] in_count, out_count;
 
     // ------------------------------------------------------------------
     // Output: a FIFO of frozen 8-byte groups, drained by auto-increment
@@ -232,6 +232,14 @@ module lz4_mmio #(
     // input-side flags that used to live at 0x14 (which now carries
     // groups_taken): [5] last_taken, [4] started, [3:0] groups ready.
     wire [31:0] stat_word = {26'd0, last_taken, started, ofill};
+
+    // AXI handshake terms, declared here because the start/reset gate and the
+    // FIFO pop logic below use them; each is driven exactly once.
+    logic [3:0]  wr_reg;
+    wire         wr_hit = s_wready && s_wvalid;
+    wire         rd_hit = s_arready && s_arvalid;
+    // Reading the high half (0x08) commits / pops the head group.
+    wire         pop_req = rd_hit && (s_araddr[5:2] == 4'd2);
 
     // A CTRL bit0 write begins a fresh block, so it must clear the decoder as
     // well: a block abandoned mid-sequence leaves it waiting for input the next
@@ -348,9 +356,7 @@ module lz4_mmio #(
     // AXI4-Lite write channel
     // ------------------------------------------------------------------
     logic        aw_cap;
-    logic [3:0]  wr_reg;
     logic [AXI_IDW-1:0] aw_id_q;
-    wire         wr_hit = s_wready && s_wvalid;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -382,9 +388,6 @@ module lz4_mmio #(
     // AXI4-Lite read channel
     // ------------------------------------------------------------------
     logic [3:0]  rd_reg;
-    wire         rd_hit = s_arready && s_arvalid;
-    // Reading the high half (0x08) commits / pops the head group.
-    wire         pop_req = rd_hit && (s_araddr[5:2] == 4'd2);
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin

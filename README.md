@@ -19,7 +19,7 @@ licence of each entry read from its own licence file, in
 Three commands and no arguments:
 
 ```sh
-git clone <this repository> && cd lz4-decoder
+git clone https://github.com/systolic-labs/lz4-decompressor.git && cd lz4-decompressor
 make test          # every bench against every vector, ~40 s
 make help          # the options, and the tool variables
 ```

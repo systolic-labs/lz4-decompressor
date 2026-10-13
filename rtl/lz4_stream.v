@@ -128,10 +128,10 @@ module lz4_stream #(
     assign dst_waddr = out_count;
     assign dst_wdata = o_fifo[o_rp];
 
-    assign busy = started & ~done & ~error;
-
     logic started;
     logic done_q, error_q;
+
+    assign busy = started & ~done & ~error;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin

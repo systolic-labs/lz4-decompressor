@@ -127,6 +127,11 @@ module lz4_axi #(
     logic [1:0] wst;
     wire  wr_inflight = (wst != W_IDLE);
 
+    // Read FSM state and the write pop, declared before the error terms and the
+    // read FSM's arvalid that consume them.
+    logic        rd_state;   // 0 = idle, 1 = waiting for R
+    wire         wr_pop = (wst == W_B) && m_bvalid;
+
     wire rd_err = (rd_state == 1'b1) && m_rvalid && (m_rresp != 2'b00);
     wire wr_err = wr_pop && (m_bresp != 2'b00);
 
@@ -148,7 +153,6 @@ module lz4_axi #(
     logic [IPW-1:0]  iwwp, iwrp;
     logic [IPW:0]    iwcnt;
     logic [31:0]     rd_word;        // next word index to fetch
-    logic            rd_state;       // 0 = idle, 1 = waiting for R
 
     wire rd_inflight = (rd_state == 1'b1);
 
@@ -160,6 +164,21 @@ module lz4_axi #(
     assign m_arvalid = (rd_state == 1'b0) && busy && (rd_word < in_words)
                        && (iwcnt < IFW[IPW:0]) && !wr_inflight;
     assign m_rready  = 1'b1;
+
+    // ---- byte feed: shift the head word out one byte at a time ----
+    logic [63:0] ish;
+    logic [3:0]  iw_rem;
+    logic [31:0] ip_taken;
+    wire  iw_avail  = (iwcnt != 0);
+    wire  feed_last = (iw_rem == 4'd1);
+    wire  feed_take = (iw_rem != 0) && (ip_taken < ilen);
+    wire  in_valid  = busy && feed_take;
+    wire [7:0] in_data = ish[7:0];
+    wire  in_last   = (ip_taken == (ilen - 32'd1));
+    wire  in_ready;
+    wire  dec_takes = in_valid && in_ready;
+    wire  need_word = (iw_rem == 4'd0) || (dec_takes && feed_last);
+    wire  feed_load = need_word && iw_avail;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -184,21 +203,6 @@ module lz4_axi #(
                           - (feed_load ? 1'b1 : 1'b0);
         end
     end
-
-    // ---- byte feed: shift the head word out one byte at a time ----
-    logic [63:0] ish;
-    logic [3:0]  iw_rem;
-    logic [31:0] ip_taken;
-    wire  iw_avail  = (iwcnt != 0);
-    wire  feed_last = (iw_rem == 4'd1);
-    wire  feed_take = (iw_rem != 0) && (ip_taken < ilen);
-    wire  in_valid  = busy && feed_take;
-    wire [7:0] in_data = ish[7:0];
-    wire  in_last   = (ip_taken == (ilen - 32'd1));
-    wire  in_ready;
-    wire  dec_takes = in_valid && in_ready;
-    wire  need_word = (iw_rem == 4'd0) || (dec_takes && feed_last);
-    wire  feed_load = need_word && iw_avail;
 
     assign dbg_feed = ip_taken;
 
@@ -296,8 +300,6 @@ module lz4_axi #(
     assign m_wlast   = 1'b1;
     assign m_wvalid  = (wst == W_W);
     assign m_bready  = 1'b1;
-
-    wire wr_pop = (wst == W_B) && m_bvalid;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
